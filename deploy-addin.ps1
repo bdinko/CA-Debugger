@@ -22,20 +22,26 @@ $EngineProj = Join-Path $RepoRoot "src\ClarionDbg.Cli\ClarionDbg.Cli.csproj"
 $EngineOut  = Join-Path $RepoRoot "src\ClarionDbg.Cli\bin\Debug\net48"
 
 function Resolve-MSBuild {
+    # Prefer `dotnet msbuild`: when the standalone .NET SDK is newer than Visual Studio,
+    # VS MSBuild can fail to resolve Microsoft.NET.Sdk for SDK-style projects (MSB4236/MSB4276).
+    if (Get-Command dotnet -ErrorAction SilentlyContinue) { return "dotnet" }
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
         $found = & $vswhere -latest -requires Microsoft.Component.MSBuild `
                             -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
         if ($found -and (Test-Path $found)) { return $found }
     }
-    throw "MSBuild.exe not found. Install Visual Studio with the MSBuild component."
+    throw "MSBuild.exe not found. Install the .NET SDK or Visual Studio with the MSBuild component."
 }
 $MSBuild = Resolve-MSBuild
+# Null args are dropped by PowerShell when invoking native commands, so this prefix
+# turns the call into `dotnet msbuild ...` or plain `MSBuild.exe ...` transparently.
+$MSBuildPrefix = if ($MSBuild -eq "dotnet") { "msbuild" } else { $null }
 
 # Clarion install roots per version (first existing root wins).
 $Versions = @{
     "12" = @("C:\Clarion12")
-    "11" = @("d:\Clarion11.1EE", "C:\Clarion11-13372")
+    "11" = @("C:\Clarion11.1-13810", "d:\Clarion11.1EE", "C:\Clarion11-13372")
     "10" = @("C:\Clarion10", "C:\Clarion10v8")
 }
 $TargetVersions = if ($Version -eq "all") { @("12","11","10") } else { @($Version) }
@@ -48,7 +54,7 @@ if ($Kill) {
 # --- Build engine once (version-independent net48/x86) ---
 if (-not $NoBuild) {
     Write-Host "Building ClarionDbg engine..." -ForegroundColor Cyan
-    & $MSBuild $EngineProj /t:Build /restore /p:Configuration=Debug /v:minimal /nologo
+    & $MSBuild $MSBuildPrefix $EngineProj /t:Build /restore /p:Configuration=Debug /v:minimal /nologo
     if ($LASTEXITCODE -ne 0) { Write-Host "Engine build failed." -ForegroundColor Red; exit 1 }
 }
 
@@ -59,7 +65,7 @@ foreach ($ver in $TargetVersions) {
     if (-not $NoBuild) {
         Write-Host ""
         Write-Host "Building addin for Clarion $ver ($root)..." -ForegroundColor Cyan
-        & $MSBuild $AddinProj /t:Build /restore /p:Configuration=Debug /p:ClarionRoot=$root /v:minimal /nologo
+        & $MSBuild $MSBuildPrefix $AddinProj /t:Build /restore /p:Configuration=Debug /p:ClarionRoot=$root /v:minimal /nologo
         if ($LASTEXITCODE -ne 0) { Write-Host "Addin build failed for Clarion $ver." -ForegroundColor Red; exit 1 }
     }
 
