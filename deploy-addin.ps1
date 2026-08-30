@@ -25,11 +25,29 @@ function Resolve-MSBuild {
     # Prefer `dotnet msbuild`: when the standalone .NET SDK is newer than Visual Studio,
     # VS MSBuild can fail to resolve Microsoft.NET.Sdk for SDK-style projects (MSB4236/MSB4276).
     if (Get-Command dotnet -ErrorAction SilentlyContinue) { return "dotnet" }
+
+    # No .NET SDK on PATH — fall back to Visual Studio's MSBuild, but pick it carefully.
+    # -latest picks the highest-VERSION-NUMBER install, not the most complete one — a newer VS
+    # (Preview/Insider, or one missing the ".NET desktop development" workload) can win over an
+    # older, fully-functional one and lack MSBuild's .NET SDK resolver entirely. Building an
+    # SDK-style project (<Project Sdk="Microsoft.NET.Sdk">) with that MSBuild fails with
+    # "Could not resolve SDK Microsoft.NET.Sdk" even though the project itself is fine. So: check
+    # every installed instance (newest first) and skip any whose MSBuild lacks the resolver DLL,
+    # instead of trusting -latest blindly.
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
-        $found = & $vswhere -latest -requires Microsoft.Component.MSBuild `
-                            -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-        if ($found -and (Test-Path $found)) { return $found }
+        $candidates = & $vswhere -all -prerelease -requires Microsoft.Component.MSBuild `
+                            -find "MSBuild\**\Bin\MSBuild.exe" -sort
+        foreach ($msbuild in $candidates) {
+            if (-not (Test-Path $msbuild)) { continue }
+            $resolverDir = Join-Path (Split-Path $msbuild -Parent) "SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver"
+            if (Test-Path $resolverDir) { return $msbuild }
+        }
+        if ($candidates) {
+            $msg = "Found MSBuild.exe (e.g. $($candidates[0])) but none have the .NET SDK resolver. "
+            $msg += "Install the '.NET desktop development' workload for that Visual Studio, or install an older one alongside it."
+            throw $msg
+        }
     }
     throw "MSBuild.exe not found. Install the .NET SDK or Visual Studio with the MSBuild component."
 }
@@ -40,9 +58,10 @@ $MSBuildPrefix = if ($MSBuild -eq "dotnet") { "msbuild" } else { $null }
 
 # Clarion install roots per version (first existing root wins).
 $Versions = @{
-    "12" = @("C:\Clarion12")
-    "11" = @("C:\Clarion11.1-13810", "d:\Clarion11.1EE", "C:\Clarion11-13372")
-    "10" = @("C:\Clarion10", "C:\Clarion10v8")
+    # Local installs first, then the ones upstream ships; first existing path wins.
+    "12" = @("C:\Clarion12", "d:\Clarion12", "d:\_dev\C111")
+    "11" = @("C:\Clarion11.1-13810", "d:\Clarion11.1EE", "C:\Clarion11-13372", "d:\_dev\C111")
+    "10" = @("C:\Clarion10", "C:\Clarion10v8", "d:\Clarion10")
 }
 $TargetVersions = if ($Version -eq "all") { @("12","11","10") } else { @($Version) }
 

@@ -32,6 +32,10 @@
   .hdr-title { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); padding:0 4px; }
   .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
   .tbtn:hover { background:var(--btnhover); }
+  /* Run to Cursor only means anything while paused — gate it on body.paused (set by setPaused),
+     mirroring how the mini source view's own right-click item greys itself out. */
+  #btnRtc { opacity:.4; pointer-events:none; }
+  body.paused #btnRtc { opacity:1; pointer-events:auto; }
   .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
   .dot { width:8px; height:8px; border-radius:50%; background:#888; }
   .runstate.paused .dot { background:#e2b341; box-shadow:0 0 6px #e2b34188; }
@@ -155,6 +159,8 @@
   .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
   .frame .kind { margin-left:auto; color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 5px; }
   .frame.unknown .fn { color:var(--fg-dim); font-style:italic; }
+  .frame.uncertain { opacity:.55; }
+  .frame .unc { flex:none; color:var(--orange); font-size:11px; cursor:help; }
 
   .bpitem { border-bottom:1px solid transparent; }
   .bp { display:flex; align-items:center; gap:7px; padding:3px 8px 3px 14px; font-size:13px; }
@@ -266,6 +272,10 @@
   <div class="toolbar">
     <span class="hdr-title">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
+    <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
+         actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
+         surface until a Monaco-side context-menu / gutter trigger exists — that one sends this same message. -->
+    <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px" onclick="send('runtocursor')">▶| Run to Cursor</button>
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -786,10 +796,11 @@
   function wireEdit(row){
     if(!row) return;
     const cell=row.querySelector('.vval'); if(!cell || !cell.dataset.va) return;
-    if(row.querySelector('.vedit-btn')) return;
-    const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
-    btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
-    cell.insertAdjacentElement('afterend', btn);
+    if(!row.querySelector('.vedit-btn')){
+      const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
+      btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
+      cell.insertAdjacentElement('afterend', btn);
+    }
   }
   function onVarSet(m){
     if(!m || !m.ok) return;                  // failures are surfaced in the console by the host
@@ -854,6 +865,14 @@
   // top row carries an _applyVis closure; re-render replaces the closures, so no stale registry).
   function applyVarFilter(){ const t=$('varTree'); if(!t) return; t.querySelectorAll('.row').forEach(r=>{ if(r._applyVis) r._applyVis(); }); }
 
+  // ---- persisted expand-state across live re-renders (e.g. after a debug step rebuilds the whole tree
+  // with fresh live values) — keyed by a dotted name-path from the tree root ("Local Variables>Grp>Value").
+  // Re-rendering the SAME tree (same names, new values) then restores exactly which nodes were open instead
+  // of forcing a re-click after every step. A path that no longer matches anything in the new tree is simply
+  // never consulted — harmless, self-cleaning by construction. Shared across all variable trees (Locals,
+  // Module Data, per-frame Call-Stack locals); each tree's own root prefix (see call sites) keeps them apart.
+  let openPaths = new Set();
+
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
   // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
   // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
@@ -867,7 +886,7 @@
       +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+arr.length+'</span>';
     el.appendChild(hdr);
     const state={open:true};
-    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1); const hay=varHay(v);
+    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label); const hay=varHay(v);
       h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
     function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
     hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
@@ -876,7 +895,10 @@
 
   // Render one variable row into `container`, with its descendants in a child box inserted right after it
   // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
-  function renderVarRow(container, v, depth){
+  // `parentPath` is the dotted name-path of this row's ancestors — used only to persist expand-state (see
+  // openPaths above) across re-renders; it carries no other meaning.
+  function renderVarRow(container, v, depth, parentPath){
+    const path = (parentPath||'')+'>'+(v.name||'');
     const eager = v.children || null;            // DIRECT group: members already supplied
     const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
     const expandable = (eager && eager.length) || isRef;
@@ -911,12 +933,13 @@
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
-      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1));
+      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
     if(eager && eager.length){ renderKids(eager); loaded=true; }
 
     function toggle(){
       open=!open; row.querySelector('.ar').textContent=open?'▾':'▸';
+      if(open) openPaths.add(path); else openPaths.delete(path);
       if(open && isRef && !loaded){
         loaded=true; const b=ensureBox();
         b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">…</div>';
@@ -925,6 +948,8 @@
       if(box) box.style.display=open?'':'none';
     }
     if(expandable){ row.style.cursor='pointer'; row.onclick=toggle; }
+    // restore prior expand-state (e.g. right after a step) instead of starting collapsed every time
+    if(expandable && openPaths.has(path)) toggle();
 
     return { el: row, setVisible(b){ row.style.display=b?'':'none'; if(box) box.style.display=(b&&open)?'':'none'; } };
   }
@@ -1052,10 +1077,11 @@
       // Locals availability hinges on having a frame base (ebp), NOT on a resolved proc name: a frame may
       // resolve to real locals even when its symbol name is unknown, so don't hide them behind a name.
       const canLoc = !!(f.ebp && f.ebp!=='0x0');
-      const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown');
+      const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown')+(f.uncertain?' uncertain':'');
       el._hay=((f.proc||'')+' '+(f.module||'')).toLowerCase(); el._open=false;
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
       el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
+        +(f.uncertain?'<span class="unc" title="Gjenfunnet ved rå stack-skanning, ikke via EBP-kjeden — kan være en foreldet, allerede returnert kall-adresse.">⚠</span>':'')
         +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
         +(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
       list.appendChild(el);
@@ -1066,7 +1092,7 @@
         b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">…</div>';
         requestFrameLocals(f, items=>{ b.innerHTML='';
           if(!items || !items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
-          else sortVars(items).forEach(c=>renderVarRow(b, c, 1));
+          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx));
           if(box) box.style.display=open?'':'none'; }); }
       function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
         if(open) load(); if(box) box.style.display=open?'':'none'; }
