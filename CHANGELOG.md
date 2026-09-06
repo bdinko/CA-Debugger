@@ -3,6 +3,134 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## v1.2.1 — 2026-09-01
+
+Two fixes to the panel's status display, both found by running a full debug
+session against v1.2.0.
+
+### Fixed
+
+- **The target bar could show the previous project's EXE after a debug session.**
+  While a session is running the panel deliberately ignores solution changes —
+  re-pointing the debug engine mid-session would aim it at the wrong binary — but
+  it then had no way to catch up once the session ended. If you opened a
+  different solution while debugging, the target bar kept showing the old target
+  after you stopped, until some later action happened to refresh it. It now
+  re-syncs as soon as the session ends. (This only ever affected what was
+  *displayed*: starting a session always re-resolves the target, so the wrong
+  program could not be launched.)
+- **The status line read "Not running" while the program was running.** It only
+  ever updated when the session went idle or paused, so during a run it
+  contradicted the run-state indicator next to it. It now reports launching and
+  running as well.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.2.1-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
+## v1.2.0 — 2026-09-01
+
+The debugger panel now tells you what it's pointed at and keeps up with the IDE
+on its own, instead of waiting to be refreshed.
+
+### Added
+
+- **Target bar.** The resolved target EXE is shown in the panel, full path,
+  always visible — click it to reveal the file in Explorer. It previously
+  appeared only in the Debug Console, which is a section you can hide, so with it
+  collapsed there was no way to see what was about to be launched.
+- **Live solution tracking.** Open a project and the target and Procedures list
+  populate on their own; close the solution and they clear. Previously the panel
+  resolved these only when it first opened or when you pressed ↻, so a solution
+  opened afterwards left it looking empty indefinitely.
+- **About panel**, on the ⓘ button — version, publisher, debug engine and
+  WebView2 runtime.
+- **Documentation button**, opening the user guide (the installed copy if you
+  have it, otherwise the published one).
+- **Version in the pad caption** — the docked tab reads `CA Debugger v1.2.0.<build>`,
+  where the build number is the commit the build came from.
+
+### Fixed
+
+- **Messages sent to the panel as it started up were silently discarded.** The
+  page announces itself while it is still loading, but the host treated it as not
+  yet ready and dropped everything it sent back — the initial run state, the
+  About details, and the auto-detected target message. They are now held and
+  delivered once the panel is live.
+- **Duplicate console lines** when a project opened: the target was announced on
+  every IDE event, whether or not it had changed.
+- The panel's initialization-failure message advised reopening the pad, which
+  could never have worked — closing a pad only hides it, so reopening reuses the
+  same instance. It now says to restart the IDE.
+
+### Changed
+
+- The panel header shows the product name larger and in colour, without
+  repeating the version already in the tab caption.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.2.0-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
+## v1.1.1 — 2026-08-31
+
+A patch release: stepping and breakpoint fixes contributed by the community, plus
+a versioning fix that matters for anyone installing through AddinFinder.
+
+### Fixed
+
+- **"Update available" showed forever in AddinFinder.** The addin manifest shipped
+  in v1.1.0 still declared version `1.0.0` while the release was tagged `v1.1.0`.
+  AddinFinder compares the installed manifest's version against the release tag,
+  so every v1.1.0 install reported an update that reinstalling could never clear.
+  All version numbers now come from one source and are checked at build time, so
+  the release tag and the shipped manifest cannot drift apart again.
+- **Step Out** no longer stops mid-epilogue on a procedure's own `RETURN` record.
+  Thanks to [@geircodes](https://github.com/geircodes) (#22).
+- **Step Over** no longer runs past a procedure's own prologue.
+  Thanks to [@geircodes](https://github.com/geircodes) (#25).
+- **Removing a breakpoint while the target is running** no longer resurrects it on
+  the next debug session. Thanks to [@geircodes](https://github.com/geircodes) (#23).
+- **Unnamed `GROUP` members and the `_main` symbol** are now recovered from TSWD
+  debug info, so they resolve by name instead of appearing blank.
+  Thanks to [@geircodes](https://github.com/geircodes) (issues #19, #21).
+- **Locals and frame names** resolve correctly when a symbol's `moduleIdx` space
+  diverges from the module table. Thanks to
+  [@msarson](https://github.com/msarson) (#17).
+
+### Changed
+
+- **Run to cursor** now reads the live cursor position from the active Monaco
+  editor rather than the debugger's own Source panel, so it follows where you are
+  actually looking. Based on a spike by
+  [@geircodes](https://github.com/geircodes) (#24).
+- `deploy-addin.ps1` again finds Clarion installs on `C:` alongside `D:` paths.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.1.1-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
 ## v1.1.0 — 2026-06-16
 
 A large feature release focused on the debugging experience — richer breakpoints,

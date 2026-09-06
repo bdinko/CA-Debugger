@@ -339,8 +339,8 @@ namespace ClarionDbg.Cli
                         }
                         else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
                         {
-                            // the hijacked THR$GetInstance call returned into our unmapped magic
-                            // address — EAX now holds the thread's live instance VA
+                            // a hijacked func-eval call (a `watch` of THREADed data) returned into our
+                            // unmapped magic address — collect its result and restore the pause state.
                             status = OnEvalComplete(tid);
                         }
                         else
@@ -465,7 +465,7 @@ namespace ClarionDbg.Cli
         /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
         /// services stdin commands until a resume-type command arrives.
         /// </summary>
-        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
+        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason, bool emitPaused = true)
         {
             _pauseRequested = false;  // any pause we reach consumes a pending pause request
             _instrStep = false;       // and consumes a pending instruction-step
@@ -482,10 +482,18 @@ namespace ClarionDbg.Cli
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
-                    haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (a `watch` of
+            // THREADed data — the one path that still hijacks the thread; Library State no longer does).
+            // The user never left the original stop and the watch result already went out on its own event,
+            // so a second `paused` for the same location isn't new information: the host would take it for a
+            // fresh stop and re-drive everything that keys off one. Stay silent and resume servicing commands.
+            if (emitPaused)
+            {
+                if (EmitJson)
+                    Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
+                        haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+                Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            }
 
             while (true)
             {
@@ -584,6 +592,13 @@ namespace ClarionDbg.Cli
                         // handler re-enters it with the original context restored.
                         if (HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx))
                             return;
+                        break;
+
+                    case "libstate":
+                        // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…). Read by EMULATING each
+                        // ClaRUN getter read-only — synchronous and safe at any stop, so it answers inline
+                        // (no thread hijack, no leaving the pause loop).
+                        HandleLibStateCommand(parts, tid, hThread);
                         break;
 
                     case "quit": case "q": case "kill":
@@ -712,11 +727,17 @@ namespace ClarionDbg.Cli
             return c;
         }
 
-        /// <summary>uint VA -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
+        /// <summary>uint -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
         /// compiler-inserted uint->long widen followed by IntPtr's explicit operator(long) does a CHECKED
-        /// (int) cast internally — any VA >= 0x80000000 (large-address-aware targets routinely hand out
-        /// stack/heap addresses up there) throws OverflowException. ReadProcessMemory/WriteProcessMemory only
-        /// want the raw bit pattern, so reinterpreting unchecked is correct here.</summary>
+        /// (int) cast internally — any value >= 0x80000000 (large-address-aware targets routinely hand out
+        /// stack/heap addresses up there) throws OverflowException. The Win32 callee only wants the raw bit
+        /// pattern, so reinterpreting unchecked is correct here.
+        ///
+        /// Use this for EVERY uint->IntPtr conversion, not just addresses: the trap is in the conversion,
+        /// not in what the number means. Debug-event HANDLE values go through it too — Windows keeps handles
+        /// small in practice, so the overflow is latent there rather than observed, but a bare (IntPtr)uint
+        /// anywhere in this file is the bug from issue #20 waiting to be reintroduced. There should be no
+        /// remaining uint-sourced (IntPtr) casts, so the pattern can be grepped for as a rule.</summary>
         private static IntPtr Ptr(uint va) => (IntPtr)unchecked((int)va);
 
         private void WriteU32(uint va, uint value)
@@ -898,7 +919,7 @@ namespace ClarionDbg.Cli
         {
             if (hFile == 0) return null;
             var sb = new System.Text.StringBuilder(520);
-            uint n = GetFinalPathNameByHandle((IntPtr)hFile, sb, (uint)sb.Capacity, 0);
+            uint n = GetFinalPathNameByHandle(Ptr(hFile), sb, (uint)sb.Capacity, 0);
             if (n == 0) return null;
             string p = sb.ToString();
             if (p.StartsWith(@"\\?\UNC\")) p = @"\\" + p.Substring(8);
@@ -909,7 +930,7 @@ namespace ClarionDbg.Cli
         /// <summary>Close a raw debug-event handle (the LOAD_DLL hFile) so we don't leak it.</summary>
         private static void CloseHandleValue(uint handle)
         {
-            if (handle != 0) Native.CloseHandle((IntPtr)handle);
+            if (handle != 0) Native.CloseHandle(Ptr(handle));
         }
 
         // --- DEBUG_EVENT header accessors (first 12 bytes) ---

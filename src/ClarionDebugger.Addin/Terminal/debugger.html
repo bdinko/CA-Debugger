@@ -12,6 +12,9 @@
     --purple:#c586c0; --red:#f48771; --num:#b5cea8; --section:#bbbbbb;
     --input:#3c3c3c; --cur:#3a3d1f; --popup:#252526; --popup-border:#454545; --btnhover:#ffffff14;
     --name:#9cdcfe;
+    /* Panel title. Its own token because neither --blue nor --accent-hi reads well on the
+       titlebar in BOTH themes: --accent-hi is muddy on dark, --blue is near-navy on light. */
+    --hdr:#6cb6f0;
   }
   body.light {
     --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
@@ -21,6 +24,7 @@
     --purple:#9b2393; --red:#cd3131; --num:#0a7a3a; --section:#555a60;
     --input:#ffffff; --cur:#fff6c8; --popup:#ffffff; --popup-border:#c4c4c8; --btnhover:#0000000d;
     --name:#0b5cad;
+    --hdr:#1668c9;
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; }
@@ -29,7 +33,9 @@
   .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
 
   .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
-  .hdr-title { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); padding:0 4px; }
+  /* Product name, styled to stand out the way Clarion Assistant's does: larger, blue, and mixed
+     case rather than small uppercase. Not interactive — About is the (i) button. */
+  .hdr-title { font-size:14px; font-weight:700; letter-spacing:.2px; color:var(--hdr); padding:0 4px; }
   .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
   .tbtn:hover { background:var(--btnhover); }
   /* Run to Cursor only means anything while paused — gate it on body.paused (set by setPaused),
@@ -44,6 +50,18 @@
 
   .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
   .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
+
+  /* Target bar — the resolved EXE, always on screen. This used to be announced only in the Debug
+     Console, which is a hideable section, so with it collapsed there was no way to see what was
+     about to be launched. Full path, not just the filename: which build you are attached to is the
+     question this answers. Click reveals it in File Explorer. */
+  .exebar { flex:none; display:flex; align-items:baseline; gap:8px; padding:4px 12px 5px;
+            background:var(--titlebar); border-bottom:1px solid var(--border); font-size:11px; }
+  .exebar .lbl { color:var(--fg-dim); text-transform:uppercase; letter-spacing:.5px; font-weight:700; flex:none; }
+  .exebar .path { color:var(--blue); overflow-wrap:anywhere; cursor:pointer; }
+  .exebar .path:hover { color:var(--accent-hi); text-decoration:underline; }
+  .exebar .path.none { color:var(--fg-dim); cursor:default; text-decoration:none; font-style:italic; }
+  .exebar .path.missing { color:var(--red); }
 
   .main { flex:1; display:flex; min-height:0; }
   .sidebar { width:360px; min-width:180px; background:var(--panel); display:flex; flex-direction:column; overflow-y:auto; flex:none; }
@@ -119,6 +137,10 @@
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
   .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
   .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
+  .lib-grp { color:var(--fg-dim); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding:5px 10px 2px; border-top:1px solid #ffffff0f; }
+  .lib-grp:first-child { border-top:0; }
+  #libBody .row { display:flex; justify-content:space-between; padding:1px 10px; }
+  #libBody .vname { color:var(--fg); } #libBody .vval { max-width:60%; }
   .vval.editable { cursor:text; border-radius:3px; }
   .paused .vval.editable:hover { background:#ffffff14; outline:1px dotted #ffffff33; }
   .vedit { font:inherit; color:var(--fg); background:var(--titlebar); border:1px solid var(--blue); border-radius:3px; padding:0 3px; min-width:70px; max-width:170px; }
@@ -171,6 +193,12 @@
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
   .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
   .bp .bplink:hover { filter:brightness(1.25); }
+  /* owning procedure (+ routine crumb) — subordinate to module:line. The outsized flex-shrink is what
+     makes it yield room before module:line does: flex distributes shrink in proportion to each item's
+     base size, so a plain "0 1 auto" would shorten the location alongside it. min-width:0 is what lets a
+     flex child shrink below its content at all, and is required for the ellipsis to appear. */
+  .bp .bpproc { color:var(--yellow); font-size:11px; opacity:.85; flex:0 999 auto; min-width:0;
+                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:help; }
 
   .procfilter { padding:5px 10px 5px 14px; }
   .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
@@ -251,6 +279,20 @@
   .modal-x { cursor:pointer; color:var(--fg-dim); font-size:14px; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; border-radius:4px; }
   .modal-x:hover { background:var(--btnhover); color:var(--fg-bright); }
   .modal-body { padding:4px 16px 16px; }
+
+  /* About panel. Cards mirror the Clarion Assistant About layout so the two addins read as a set.
+     The version line is intentionally allowed to wrap rather than clip — Clarion Assistant's
+     equivalent truncates to two components, which is the bug this one must not reproduce. */
+  .ab-card { background:var(--btnhover); border:1px solid var(--popup-border); border-radius:6px; padding:14px 16px; margin-top:12px; }
+  .ab-ver { color:var(--accent-hi); font-size:20px; font-weight:700; line-height:1.25; overflow-wrap:anywhere; }
+  .ab-tag { color:var(--fg-dim); font-size:12px; margin-top:4px; }
+  .ab-tbl { width:100%; border-collapse:collapse; }
+  .ab-tbl th { text-align:left; font-weight:400; color:var(--fg-dim); font-size:12px; padding:7px 12px 7px 0; vertical-align:top; white-space:nowrap; width:34%; }
+  .ab-tbl td { text-align:left; color:var(--fg); font-size:12px; padding:7px 0; vertical-align:top; overflow-wrap:anywhere; }
+  .ab-tbl tr + tr th, .ab-tbl tr + tr td { border-top:1px solid var(--popup-border); }
+  .ab-tbl a { color:var(--accent-hi); }
+  .ab-head { color:var(--accent-hi); font-size:12px; font-weight:700; margin-bottom:2px; }
+  .ab-foot { color:var(--fg-dim); font-size:11px; margin-top:14px; }
   .set-section { margin-top:12px; }
   .set-h { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); margin-bottom:4px; }
   .set-note { font-size:11.5px; line-height:1.5; color:var(--fg-dim); margin-bottom:10px; }
@@ -270,7 +312,7 @@
   <!-- Slim header: the 7 debug controls now live on the main IDE toolbar. This keeps only the
        run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
-    <span class="hdr-title">CA Debugger</span>
+    <span class="hdr-title" id="hdrTitle">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
@@ -279,12 +321,26 @@
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
+    <!-- Explicit About entry point. The in-panel title is also clickable, but it renders small,
+         dim and uppercase, so it is not discoverable on its own — and the mixed-case caption users
+         actually see is the IDE's pad tab, which is chrome we cannot attach a handler to. -->
+    <button class="tbtn" id="btnDocs" title="User guide — open the CA Debugger documentation" style="margin-left:2px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+    </button>
+    <button class="tbtn" id="btnAbout" title="About CA Debugger" style="margin-left:2px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5"/><path d="M12 8h.01"/></svg>
+    </button>
     <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:2px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
 
   <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
+
+  <div class="exebar">
+    <span class="lbl">Target</span>
+    <span class="path none" id="exePath" title="">No target resolved — open a project, or build the app.</span>
+  </div>
 
   <div class="main">
     <div class="sidebar col" id="colLeft">
@@ -324,6 +380,10 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
       </details>
+      <details class="section" data-sec="libstate">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Library State <span class="hint">per-thread RTL state</span><span class="sec-refresh" id="libRefresh" title="Refresh Library State">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <div class="body mono" id="libBody"><div class="empty">Expand while paused to read the thread's RTL state.</div></div>
+      </details>
     </div>
 
     <div class="splitter" id="splitter"></div>
@@ -354,6 +414,13 @@
     <div class="modal" role="dialog" aria-label="Settings">
       <div class="modal-head"><span>Settings</span><span class="modal-x" id="settingsClose" title="Close">✕</span></div>
       <div class="modal-body" id="settingsBody"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="aboutBackdrop">
+    <div class="modal" role="dialog" aria-label="About CA Debugger">
+      <div class="modal-head"><span>About CA Debugger</span><span class="modal-x" id="aboutClose" title="Close">✕</span></div>
+      <div class="modal-body" id="aboutBody"></div>
     </div>
   </div>
 
@@ -437,6 +504,89 @@
   $('settingsClose').onclick=closeSettings;
   $('settingsBackdrop').addEventListener('click',e=>{ if(e.target===$('settingsBackdrop')) closeSettings(); });
 
+  // ---- About -------------------------------------------------------------------------------
+  // Populated by the host's "about" push on ready. Everything is written with textContent rather
+  // than innerHTML: most fields are host constants, but the WebView2 runtime string comes from the
+  // installed browser and the same class of bug (DOM XSS via an attacker-influenced string) has
+  // already been found once in this codebase's sibling list rendering.
+  var aboutInfo=null;
+  function aboutOpen(){ return $('aboutBackdrop').classList.contains('show'); }
+  function closeAbout(){ $('aboutBackdrop').classList.remove('show'); }
+  // Always opens. An earlier version returned silently when the host push had not arrived yet,
+  // which is indistinguishable from a dead button — if the data is missing, say so in the panel
+  // rather than doing nothing.
+  function openAbout(){
+    // Ask the host afresh each time so the panel reflects live state rather than a value captured
+    // once at startup. The host's push on 'ready' now survives too (it buffers messages until the
+    // WebView is ready), but this request is what makes About independent of initialization
+    // ordering. The panel repaints when the reply arrives.
+    send('about');
+    if(!aboutInfo) setAbout({product:'CA Debugger',version:'',tagline:'Version information unavailable — the debugger panel did not receive it from the IDE host.',publisher:'ClarionLive',website:'https://github.com/ClarionLive/CA-Debugger',year:'2026'});
+    $('aboutBackdrop').classList.add('show');
+  }
+
+  function setAbout(m){
+    aboutInfo=m;
+    // The in-panel title deliberately stays "CA Debugger" with no version. The pad's own tab
+    // caption already carries it (stamped into the addin manifest at build time by
+    // StampAddinManifest), and repeating it two rows apart was just noise. The version lives in
+    // the About panel, reachable from the (i) button.
+    var body=$('aboutBody');
+    body.textContent='';
+
+    var hero=document.createElement('div'); hero.className='ab-card';
+    var v=document.createElement('div'); v.className='ab-ver'; v.textContent='Version '+(m.version||'unknown');
+    var t=document.createElement('div'); t.className='ab-tag'; t.textContent=m.tagline||'';
+    hero.appendChild(v); hero.appendChild(t); body.appendChild(hero);
+
+    var rows=[['Publisher',m.publisher,null],['Website',m.website,m.website],
+              ['Debug engine',m.engine,null],['Runtime',m.runtime,null]];
+    var card=document.createElement('div'); card.className='ab-card';
+    var tbl=document.createElement('table'); tbl.className='ab-tbl';
+    rows.forEach(function(r){
+      if(!r[1]) return;
+      var tr=document.createElement('tr');
+      var th=document.createElement('th'); th.textContent=r[0];
+      var td=document.createElement('td');
+      // Only ever build a link for an http(s) URL; anything else renders as plain text so a
+      // javascript:/data: string can never become a clickable target.
+      if(r[2] && /^https?:\/\//i.test(r[2])){
+        var a=document.createElement('a'); a.href=r[2]; a.target='_blank'; a.rel='noopener noreferrer';
+        a.textContent=r[1]; td.appendChild(a);
+      } else td.textContent=r[1];
+      tr.appendChild(th); tr.appendChild(td); tbl.appendChild(tr);
+    });
+    card.appendChild(tbl); body.appendChild(card);
+
+    var foot=document.createElement('div'); foot.className='ab-foot';
+    foot.textContent='© '+(m.year||'')+' '+(m.publisher||'')+'. Released under the MIT licence.';
+    body.appendChild(foot);
+  }
+
+  // ---- Target bar --------------------------------------------------------------------------
+  // textContent throughout: the path comes from the host, but it is a filesystem string we do not
+  // control the contents of, and this file has had a DOM-XSS bug of exactly that shape before.
+  var targetPath=null;
+  function setTarget(m){
+    var el=$('exePath');
+    targetPath = m && m.path ? m.path : null;
+    if(!targetPath){
+      el.className='path none';
+      el.textContent='No target resolved — open a project, or build the app.';
+      el.title='';
+      return;
+    }
+    el.className = m.exists ? 'path' : 'path missing';
+    el.textContent = targetPath;
+    el.title = m.exists ? 'Click to show in File Explorer' : 'Not on disk yet — build the app. Click to show its folder.';
+  }
+  $('exePath').onclick=function(){ if(targetPath) send('revealexe'); };
+
+  $('btnDocs').onclick=function(){ send('opendocs'); };
+  $('btnAbout').onclick=openAbout;
+  $('aboutClose').onclick=closeAbout;
+  $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
+
   document.addEventListener('keydown',e=>{
     // 1) capture mode — record the next combo for the command being rebound
     if(capturing){
@@ -450,6 +600,8 @@
     }
     // 2) while Settings is open, Esc closes it and debug keys stay inert
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
+    // 2b) same for About — a modal must swallow debug shortcuts, not just look modal
+    if(aboutOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAbout(); } return; }
     // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
     // condition evaluator is the source of truth for whether a command is valid in the current state; the
     // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
@@ -479,11 +631,11 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', source:'Source', console:'Debug Console'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true}; // only collapsible (<details>) panels; matches markup
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true}; // only collapsible (<details>) panels; matches markup
   let layoutLoaded=false, dragSec=null;
 
   function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
@@ -639,7 +791,14 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
+    // Every state must write the status line. Only 'idle' used to, so once a session started the
+    // bar kept the idle text — the app was visibly running while the bar still read "Not running —
+    // press Start on the IDE toolbar." The paused text is written by the pause handler, which has
+    // the procedure/module/line to name; the states below have nothing to add, so they say what is
+    // true and no more.
     if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
+    else if(state==='launching'){ $('locbar').textContent='Launching…'; }
+    else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
   }
 
   // ---- add a watch (from any of the 4 mechanisms) ----
@@ -970,6 +1129,36 @@
     send('framelocals', id+'|'+f.va+'|'+f.ebp);
   }
 
+  // ---- Library State (per-thread RTL state, read by emulating the ClaRUN getters) ----
+  // Reading runs NO target code — the engine emulates each getter read-only over the debuggee's memory —
+  // so this is safe at any stop. We still only fetch while the panel is open (and paused): on pause if
+  // open, on expand-while-paused, and on the ↻ button, since each read is a burst of memory reads and
+  // there's nothing to show for a collapsed panel. Values are cleared on resume: they reflect the moment
+  // they were read.
+  let _libReq=0, lastLibState=null, lastLibError=null;
+  function libIsOpen(){ const el=secEl('libstate'); return !!(el && el.open && !isHidden(el)); }
+  function refreshLibState(){ if(isPaused && libIsOpen()) send('libstate', String(++_libReq)); }
+  function renderLibState(){
+    const box=$('libBody'); if(!box) return;
+    if(lastLibError){ box.innerHTML='<div class="empty">'+esc(lastLibError)+'</div>'; return; }
+    if(!lastLibState){ box.innerHTML='<div class="empty">'+(isPaused?'Reading…':'Pause to read the thread’s RTL state.')+'</div>'; return; }
+    if(!lastLibState.length){ box.innerHTML='<div class="empty">No Library State.</div>'; return; }
+    box.innerHTML=''; let grp=null;
+    lastLibState.forEach(r=>{
+      if(r.group!==grp){ grp=r.group; const h=document.createElement('div'); h.className='lib-grp'; h.textContent=grp; box.appendChild(h); }
+      const d=document.createElement('div'); d.className='row';
+      const val=(r.kind==='str') ? "'"+(r.value||'')+"'" : (r.value||'0');
+      d.innerHTML='<span class="vname">'+esc(r.name)+'</span><span class="vval'+(r.kind==='str'?'':' num')+'">'+esc(val)+'</span>';
+      box.appendChild(d);
+    });
+  }
+  // Drop a reply that isn't for the newest request: a pause followed quickly by a ↻ (or another pause)
+  // leaves an earlier read in flight, and letting it land would overwrite fresher values with stale ones.
+  function onLibState(reqId, error, items){
+    if(+reqId!==_libReq) return;
+    lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState();
+  }
+
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
   // Raw data kept so the sort toggle can re-render without re-fetching.
   let lastModule='', lastModuleItems=null, lastSymbols=null;
@@ -1116,6 +1305,19 @@
       d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
       const lk=d.querySelector('.bplink');
       if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
+      // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
+      // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
+      // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
+      // stays exactly as it was, rather than showing "unknown".
+      const own=bpOwner(b.module, b.line);
+      if(own){
+        const pc=document.createElement('span'); pc.className='bpproc';
+        pc.textContent=own.routine ? (own.proc ? own.proc+' › '+own.routine : own.routine) : own.proc;
+        pc.title=own.routine
+          ? (own.proc ? 'In ROUTINE '+own.routine+' of '+own.proc : 'In ROUTINE '+own.routine)
+          : 'In '+own.proc;
+        d.appendChild(pc);
+      }
       // type styling on the dot + per-type indicator badges (titles via property = injection-safe)
       const isTrace=!!b.trace, isAdv=!!b.condition||!!b.hitMode;
       if(isAdv) d.classList.add('has-adv');
@@ -1162,18 +1364,27 @@
   }
 
   // ---- procedures (static list from the target EXE; click a file link to open the .clw at the definition) ----
-  let allProcs=[];
+  // allProcs holds EVERY symbol the host sends, ROUTINEs included — they're what lets a breakpoint name the
+  // routine it sits in. The PANEL below shows only procedures/methods: a routine isn't independently
+  // navigable the way a procedure is, and listing them would bury the procedure list they belong to.
+  let allProcs=[], procIndex=null;
+  const isProcKind = p => (p.kind||'procedure')!=='routine';
   function buildProcs(procs){
     allProcs=procs||[];
+    procIndex=null;                       // symbols changed — drop the per-module line index
+    const listed=allProcs.filter(isProcKind);
+    // Breakpoint rows carry procedure names resolved from this list, and breakpoints usually exist before
+    // it arrives (they're restored from the gutter at startup). Re-render them now that names can resolve.
+    if(bps.length) buildBps(bps);
     const el=$('procList'); if(!el) return;
-    $('procCount').textContent=allProcs.length;
-    if(!allProcs.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
+    $('procCount').textContent=listed.length;
+    if(!listed.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
     // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
     // so interpolating them into an HTML attribute would be an injection sink).
-    allProcs.forEach(p=>{ const module=p.module||'', name=p.name||'';
+    listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
       // module/line/name for the right-click "Break on entry" action (dataset assignment is injection-safe)
       d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
@@ -1185,6 +1396,48 @@
       frag.appendChild(d); });
     el.appendChild(frag);
     filterProcs($('procFilter') ? $('procFilter').value : '');
+  }
+
+  // ---- breakpoint -> owning procedure (issue #27) ----
+  // The host sends symbols sorted by NAME; ownership needs them per module in LINE order, so index once and
+  // reuse. Rebuilt whenever a `procedures` message replaces allProcs (declared with allProcs above).
+  function ensureProcIndex(){
+    if(procIndex) return procIndex;
+    procIndex={};
+    allProcs.forEach(p=>{
+      const m=(p.module||'').toLowerCase(), ln=+p.line;
+      if(!m || !(ln>0)) return;
+      (procIndex[m]||(procIndex[m]=[])).push({name:p.name||'', line:ln, rtn:(p.kind||'')==='routine'});
+    });
+    // Line order, and on a tie the routine sorts AFTER its procedure so the innermost symbol is the one a
+    // "last entry at or before this line" search lands on.
+    Object.keys(procIndex).forEach(m=>procIndex[m].sort((a,b)=>(a.line-b.line)||((a.rtn?1:0)-(b.rtn?1:0))));
+    return procIndex;
+  }
+  /// Resolve which procedure (and routine) a breakpoint sits in — {proc, routine} or null when we can't say.
+  function bpOwner(module, line){
+    const arr=ensureProcIndex()[(module||'').toLowerCase()];
+    const ln=+line;
+    if(!arr || !arr.length || !(ln>0)) return null;
+    // Binary search for the last symbol defined at or before this line. Symbols carry a definition line but
+    // no END line, so containment is "the nearest definition above you" — which is exactly right between two
+    // procedures, and for the last one in a module is right too because a Clarion procedure runs to the end
+    // of its file. The case that WOULD be a guess is a breakpoint ABOVE the first symbol (in the MAP or
+    // global data); that lands on i<0 below and we say nothing rather than reaching for the nearest name.
+    let i=-1, lo=0, hi=arr.length-1;
+    while(lo<=hi){ const mid=(lo+hi)>>1; if(arr[mid].line<=ln){ i=mid; lo=mid+1; } else hi=mid-1; }
+    if(i<0) return null;
+    const sym=arr[i];
+    if(!sym.rtn) return {proc:sym.name, routine:null};
+    // A routine decodes to "PARENT::NAME" (Clarion mangles it R$PARENT::NAME), so its own name is the part
+    // after the separator — without this the crumb would read "SelectJobs › SelectJobs::ClearFilter".
+    const sep=sym.name.lastIndexOf('::');
+    const rtn=sep>0 ? sym.name.slice(sep+2) : sym.name;         // bare R$NAME form carries no parent
+    // Prefer the enclosing symbol for the parent over the name's own prefix: the prefix is the RAW proc
+    // name, so for a routine inside a class method it would show the mangling (UPDATE@F8INICLASS) where
+    // the symbol above it is properly demangled (INICLASS.UPDATE).
+    for(let j=i-1;j>=0;j--) if(!arr[j].rtn) return {proc:arr[j].name, routine:rtn};
+    return {proc:(sep>0 ? sym.name.slice(0,sep) : null), routine:rtn};   // nothing above it — fall back to the prefix
   }
   function filterProcs(q){
     const el=$('procList'); if(!el) return;
@@ -1199,6 +1452,9 @@
   })();
   (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value));
     const rb=$('procRefresh'); if(rb) rb.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); send('proclist'); }); })();
+  // Library State: ↻ forces a re-read; expanding the panel while paused fetches on demand.
+  (function(){ const lr=$('libRefresh'); if(lr) lr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); refreshLibState(); });
+    const lp=secEl('libstate'); if(lp) lp.addEventListener('toggle',()=>refreshLibState()); })();
 
   // ---- registers ----
   function buildRegs(regs){
@@ -1305,14 +1561,17 @@
   function onMessage(data){
     let m; try{ m=JSON.parse(data); }catch(e){ return; }
     switch(m.type){
+      case 'about': setAbout(m); break;
+      case 'target': setTarget(m); break;
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
-        buildRegs(m.regs); setPaused(true); break;
-      case 'resumed': setPaused(false); break;
+        buildRegs(m.regs); setPaused(true); refreshLibState(); break;
+      case 'resumed': setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
       case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
+      case 'libstate': onLibState(m.reqId, m.error, m.items||[]); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
@@ -1322,7 +1581,7 @@
       case 'regs': buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
-      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); break;
+      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
     }
   }
   function collectSyms(symbols){ const out=[]; (symbols||[]).forEach(s=>{ out.push({name:s.name,type:s.typeName}); (s.fields||[]).forEach(f=>out.push({name:f.name,type:f.typeName})); }); return out; }

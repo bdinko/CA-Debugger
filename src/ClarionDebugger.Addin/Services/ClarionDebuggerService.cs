@@ -133,6 +133,10 @@ namespace ClarionDebugger.Services
         public string Name;     // demangled, e.g. SELECTJOBS, INICLASS.UPDATE
         public string Module;   // owning .clw basename, e.g. clbrws011.clw
         public int Line;        // 1-based definition line
+        /// <summary>"procedure", "method" or "routine". ROUTINEs are carried so a breakpoint can name the
+        /// ROUTINE it sits in and the procedure that encloses it; the Procedures PANEL filters them back out
+        /// (a routine is not independently navigable the way a procedure is).</summary>
+        public string Kind;
     }
 
     /// <summary>
@@ -173,6 +177,7 @@ namespace ClarionDebugger.Services
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
+        public event Action<string, string, string> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON)
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
@@ -411,6 +416,12 @@ namespace ClarionDebugger.Services
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
+
+        /// <summary>Request the paused thread's RTL "Library State" (ERROR/EVENT/FIELD/…) — the engine
+        /// EMULATES each ClaRUN getter read-only (no code runs in the debuggee, so this is safe at any
+        /// stop, including inside TakeEvent). Result arrives via LibStateReceived keyed by
+        /// <paramref name="reqId"/>. Paused only.</summary>
+        public bool RequestLibState(int reqId) { return SendCommand("libstate " + reqId); }
 
         /// <summary>Lazily expand a reference node: ask the engine to deref <paramref name="addrHex"/> and render
         /// the referent type's members. Result arrives via ExpandedReceived keyed by <paramref name="reqId"/>.
@@ -713,6 +724,10 @@ namespace ClarionDebugger.Services
 
                 case "framelocals":
                     FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    break;
+
+                case "libstate":
+                    LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"));
                     break;
 
                 case "watch":
@@ -1079,10 +1094,15 @@ namespace ClarionDebugger.Services
                     if (list.Count >= MaxProcedures) break;
                     string obj = m.Value;
                     string kind = GetStr(obj, "kind");
-                    if (kind != "procedure" && kind != "method") continue;
+                    // Routines come through as well as procedures/methods: they are what lets a breakpoint
+                    // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
+                    // them together with their parent by definition line, so containment falls out of the
+                    // line order — no extra symbol work. The Procedures panel filters routines back out on
+                    // the client, so this does not change what that list shows.
+                    if (kind != "procedure" && kind != "method" && kind != "routine") continue;
                     int line = GetInt(obj, "line");
                     if (line <= 0) continue;
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line });
+                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind });
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }
