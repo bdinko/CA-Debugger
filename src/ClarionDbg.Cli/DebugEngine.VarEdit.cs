@@ -52,8 +52,8 @@ namespace ClarionDbg.Cli
                 }
                 if (wantTid != selectedTid)
                 {
-                    EmitVarSetError(va, "not written: this edit was for thread " + wantTid
-                                        + ", but thread " + selectedTid + " is selected now");
+                    EmitVarSetError(va, "not written: this edit was for thread " + TidText(wantTid)
+                                        + ", but thread " + TidText(selectedTid) + " is selected now");
                     return;
                 }
             }
@@ -126,9 +126,26 @@ namespace ClarionDbg.Cli
         /// </summary>
         private bool ThreadedWriteAllowed(uint va, int len, uint selectedTid, out string reason)
         {
-            reason = null;
+            var r = ClassifyThreadedAccess(va, len, selectedTid);
+            reason = r.Allowed ? null : r.WriteRefusal(va, len);
+            return r.Allowed;
+        }
+
+        /// <summary>Which of the two refusals a range earns, if either — and the FACTS behind it, so that
+        /// every caller's wording is derived from one decision instead of re-deriving its own.
+        ///
+        /// THIS EXISTS BECAUSE THE WORDING DRIFTED FROM THE DECISION ONCE ALREADY. The expand veto asked
+        /// this guard (span-based) whether to veto, then ran its OWN point test on the start address to
+        /// decide what to SAY — so a group straddling into a template was correctly vetoed and then
+        /// labelled "another thread's data", which is a different refusal entirely. The same bug, in the
+        /// same file, had already been fixed INSIDE this method ("testing va alone was a leftover of the
+        /// start-only era"): fixing it in one formatter does not fix it in the next one somebody writes.
+        /// One decision, one source of the facts, and the wording is a rendering of it.</summary>
+        private ThreadedAccess ClassifyThreadedAccess(uint va, int len, uint selectedTid)
+        {
+            var res = new ThreadedAccess { Kind = ThreadedRefusal.None, SelectedTid = selectedTid };
             if (len < 1) len = 1;
-            // 64-bit so a write near the top of the address space cannot wrap the end past the start and
+            // 64-bit so a range near the top of the address space cannot wrap the end past the start and
             // silently turn an overlap into a miss.
             ulong wLo = va, wHi = (ulong)va + (ulong)len;
 
@@ -141,22 +158,23 @@ namespace ClarionDbg.Cli
                 uint tmplLo = m.LoadBase + m.CwtlsLo;
 
                 // 1. the shared template — unconditional, needs nothing resolved
-                if (Overlaps(wLo, wHi, tmplLo, tmplSpan))
+                uint hit;
+                if (TouchesThreadedTemplate(m, va, len, out hit))
                 {
-                    // Point at the first byte of THIS WRITE that actually lands in the template — which
-                    // is the start only when the write begins inside it. Testing `va` alone here was a
-                    // leftover of the start-only era: a write straddling in from below would report "has no
+                    // Point at the first byte of THIS RANGE that actually lands in the template — which
+                    // is the start only when the range begins inside it. Testing `va` alone here was a
+                    // leftover of the start-only era: a range straddling in from below would report "has no
                     // instance of it" even for a thread that has one. A refusal that misdescribes why is a
                     // small lie at the worst possible moment.
-                    uint hitVa = va >= tmplLo ? va : tmplLo;
-                    uint ownBase;
-                    string where = m.HasThreadedData && TryInstanceBase(m, selectedTid, out ownBase)
-                        ? " — thread " + selectedTid + "'s own copy of that byte is at 0x"
-                          + (hitVa - tmplLo + ownBase).ToString("X")
-                        : " and thread " + selectedTid + " has no instance of it";
-                    reason = "not written: " + Range(va, len) + " touches the shared " + m.Name
-                           + " template, not one thread's data" + where;
-                    return false;
+                    res.Kind = ThreadedRefusal.SharedTemplate;
+                    res.Owner = m;
+                    res.HitVa = hit;
+                    // Initialised because the && short-circuits: with no THREADed data TryInstanceBase is
+                    // never called and never assigns it. HaveOwnCopy gates every read of it anyway.
+                    uint ownBase = 0;
+                    res.HaveOwnCopy = m.HasThreadedData && TryInstanceBase(m, selectedTid, out ownBase);
+                    if (res.HaveOwnCopy) res.OwnCopyVa = res.HitVa - tmplLo + ownBase;
+                    return res;
                 }
 
                 // The instance-block comparisons DO need the import, and they are the recoverable half:
@@ -170,7 +188,7 @@ namespace ClarionDbg.Cli
                 uint blockSpan = m.CwtlsDataSize != 0 ? m.CwtlsDataSize : tmplSpan;
 
                 // 2. somebody else's instance block. There is deliberately no early "it is inside MY block,
-                //    allow" shortcut any more: with intervals a write can touch two adjacent blocks at once,
+                //    allow" shortcut any more: with intervals a range can touch two adjacent blocks at once,
                 //    and returning early on the first would skip the refusal the second one earns. Being
                 //    inside the selected thread's own block is simply the absence of any refusal.
                 foreach (uint t in _threads)
@@ -179,12 +197,121 @@ namespace ClarionDbg.Cli
                     uint otherBase;
                     if (!TryInstanceBase(m, t, out otherBase)) continue;
                     if (!Overlaps(wLo, wHi, otherBase, blockSpan)) continue;
-                    reason = "not written: " + Range(va, len) + " touches thread " + t + "'s copy of the "
-                           + m.Name + " data, but thread " + selectedTid + " is selected";
-                    return false;
+                    res.Kind = ThreadedRefusal.OtherThreadInstance;
+                    res.Owner = m;
+                    res.OwnerTid = t;
+                    res.HitVa = va >= otherBase ? va : otherBase;
+                    return res;
                 }
             }
+            return res;
+        }
+
+        /// <summary>The two ways a range can be refused, named so a caller can branch on the REASON rather
+        /// than re-testing the address to guess it.</summary>
+        private enum ThreadedRefusal { None, SharedTemplate, OtherThreadInstance }
+
+        /// <summary>One classification of a range against every image's THREADed data: the verdict plus
+        /// the facts any wording needs. Rendering lives on it so the write path and the row path cannot
+        /// describe the same verdict differently.</summary>
+        private struct ThreadedAccess
+        {
+            public ThreadedRefusal Kind;
+            public LoadedModule Owner;    // the image whose .cwtls the range touched
+            public uint HitVa;            // FIRST byte of the range inside the protected block, not its start
+            public uint OwnerTid;         // OtherThreadInstance: whose block it is
+            public uint SelectedTid;
+            public bool HaveOwnCopy;      // SharedTemplate: the selected thread has an instance of its own
+            public uint OwnCopyVa;        // ...and HitVa's address within it
+
+            public bool Allowed { get { return Kind == ThreadedRefusal.None; } }
+
+            /// <summary>The write path's wording. Unchanged from when this method formatted it inline —
+            /// `protocolcheck` asserts the refusal says "template", and the pad shows it verbatim.</summary>
+            public string WriteRefusal(uint va, int len)
+            {
+                if (Kind == ThreadedRefusal.SharedTemplate)
+                {
+                    string where = HaveOwnCopy
+                        ? " — thread " + TidText(SelectedTid) + "'s own copy of that byte is at 0x" + OwnCopyVa.ToString("X")
+                        : " and thread " + TidText(SelectedTid) + " has no instance of it";
+                    return "not written: " + Range(va, len) + " touches the shared " + Owner.Name
+                         + " template, not one thread's data" + where;
+                }
+                if (Kind == ThreadedRefusal.OtherThreadInstance)
+                    return "not written: " + Range(va, len) + " touches thread " + TidText(OwnerTid) + "'s copy of the "
+                         + Owner.Name + " data, but thread " + TidText(SelectedTid) + " is selected";
+                return null;
+            }
+        }
+
+        /// <summary>Does [<paramref name="va"/>, va+<paramref name="len"/>) touch this image's shared
+        /// .cwtls TEMPLATE — and if so, at which byte?
+        ///
+        /// THE ONE TEST FOR A RANGE. Three paths ask it over a span — the write guard, the expand veto,
+        /// and the module-data panel — and the panel asked with a POINT test on the symbol's start RVA
+        /// until this shared it. Same defect class as the note that used to drift from the veto: a rule
+        /// stated in two places is a rule that will be fixed in one of them.
+        ///
+        /// Until ef0a941d (2026-09-22) the same `Rva >= CwtlsLo && Rva < CwtlsHi` point test survived in
+        /// DebugEngine.Watch.cs, DebugEngine.ThreadScan.cs and DebugEngine.BpAdvanced.cs, each with the
+        /// symbol's size in scope and unused. They now ask <see cref="ClassifyTemplateSpan"/>, which asks
+        /// this; tools/test-threaded-template-rule.ps1 fails if a direct Rva-vs-Cwtls comparison reappears
+        /// outside this file.
+        /// <paramref name="hitVa"/> is the FIRST byte of the range inside the template, which is the start
+        /// only when the range begins inside it.</summary>
+        private static bool TouchesThreadedTemplate(LoadedModule m, uint va, int len, out uint hitVa)
+        {
+            hitVa = 0;
+            if (m == null || m.LoadBase == 0 || m.CwtlsHi == 0) return false;
+            uint tmplSpan = m.CwtlsHi - m.CwtlsLo;     // file-aligned; over-width here is only padding
+            if (tmplSpan == 0) return false;
+            if (len < 1) len = 1;
+            uint tmplLo = m.LoadBase + m.CwtlsLo;
+            // 64-bit so a range near the top of the address space cannot wrap its end past its start.
+            if (!Overlaps(va, (ulong)va + (ulong)len, tmplLo, tmplSpan)) return false;
+            hitVa = va >= tmplLo ? va : tmplLo;
             return true;
+        }
+
+        /// <summary>Where a resolved symbol's span sits against its image's shared .cwtls template.</summary>
+        internal enum TemplateSpan
+        {
+            /// <summary>No byte of the symbol is in the template: ordinary data, read where it is.</summary>
+            Outside,
+            /// <summary>The symbol STARTS in the template, so its per-thread instance is at the same offset
+            /// inside the thread's block and TryResolveThreadedInstance can relocate it.</summary>
+            StartsInside,
+            /// <summary>The symbol starts OUTSIDE the template and reaches into it. It cannot be relocated:
+            /// only part of it is per-thread, and the instance mapping works from an offset inside the block,
+            /// which this start is not.</summary>
+            Straddling,
+        }
+
+        /// <summary>The template question for a whole SYMBOL, asked over its span through
+        /// <see cref="TouchesThreadedTemplate"/>. Every path that classifies a resolved name asks this —
+        /// the module-data panel, Watch, the thread scan and breakpoint conditions — and each still decides
+        /// for itself what a straddling symbol means for it: a panel labels it, a condition refuses to answer.
+        /// The PREDICATE is shared; the verdict is not.</summary>
+        private static TemplateSpan ClassifyTemplateSpan(LoadedModule m, uint va, uint size)
+        {
+            uint hitVa;
+            int len = size > int.MaxValue ? int.MaxValue : (int)size;
+            if (!TouchesThreadedTemplate(m, va, len, out hitVa)) return TemplateSpan.Outside;
+            return hitVa == va ? TemplateSpan.StartsInside : TemplateSpan.Straddling;
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the shipped range test, so the straddling discriminator
+        /// is asserted against the real rule rather than a copy of it. Pure; touches no engine state.</summary>
+        internal static bool TouchesThreadedTemplateForTest(LoadedModule m, uint va, int len, out uint hitVa)
+        {
+            return TouchesThreadedTemplate(m, va, len, out hitVa);
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the shipped symbol classification. Pure.</summary>
+        internal static TemplateSpan ClassifyTemplateSpanForTest(LoadedModule m, uint va, uint size)
+        {
+            return ClassifyTemplateSpan(m, va, size);
         }
 
         /// <summary>Do the half-open intervals [wLo,wHi) and [bLo, bLo+bLen) share a byte?</summary>
@@ -236,6 +363,11 @@ namespace ClarionDbg.Cli
         internal void RegisterThreadedModuleForTest(string name, uint loadBase, uint cwtlsLo, uint cwtlsHi,
                                                     uint iatRva = 4)
         {
+            // Sixth mutating seam, and the reason it is guarded like the other five: what it registers is the
+            // .cwtls range that ThreadedWriteAllowed consults, so a fake range on an ATTACHED engine could let
+            // a real write past the shared-template refusal. An invariant that covers five of six mutating
+            // seams reads to the next person as optional, which is worse than not having one.
+            RefuseSeamIfAttached("RegisterThreadedModuleForTest");
             _modules.Add(new LoadedModule
             {
                 Name = name, LoadBase = loadBase, Size = 0x200000,

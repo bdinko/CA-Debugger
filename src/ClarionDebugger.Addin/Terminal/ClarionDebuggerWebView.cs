@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 using ICSharpCode.SharpDevelop.Project;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -62,10 +63,35 @@ namespace ClarionDebugger.Terminal
         // whether confirmation ever arrives. UI-thread only.
         private string _pendingRtcKey;
         private int _pendingRtcLine;   // requested line of the pending run-to-cursor — matches the engine's bp echo by line
+        // A run-to-cursor the engine REFUSED in one image may still have armed in another (arm-all, contract C3):
+        // its key stays tracked - out of the pane - while a `bp del` removes every copy, until the `bp list` sent
+        // after that del is answered (the engine answers in order, so every echo for the add and the del is in
+        // by then). Null when no such cleanup is in flight. UI-thread only.
+        private string _rtcCleanupKey;
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // What the page may hand back, as the HOST issued it (afbc68c7). The page names a Procedures row by
+        // the id it was sent with, and an edit by the row's own tuple; both are checked here rather than
+        // trusted. UI-thread only, like every other piece of pad state.
+        private readonly ProcedureIds _procIds = new ProcedureIds();
+        // It reads the thread selection from the service, the one owner of it (49538b78 8b); set in the constructor.
+        private readonly EditGrants _editGrants;
+        // The attach picker's pids, as the HOST listed them (3f2d747f): `attach` is honoured only for one of these.
+        private readonly ListedProcesses _listedProcs = new ListedProcesses();
+        private int _procsGen;   // generation of the newest process listing; an older one arriving late is dropped
+        // The ATTACH session in progress, or null for a launch / no session. UI-thread only.
+        private AttachContext _attach;
+        // The app last attached to, for the "Detached; <name>" line only. The engine's `detached` event names just the
+        // pid, and when the engine's exit is handled before that buffered line, both the service's target and _attach
+        // are already gone. Display only: nothing decides anything on it.
+        private string _lastAttachName;
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
+        // What the target bar may claim about _exe (contract C4, 0214f33a), and the one line it shows beside it.
+        // UNCONFIRMED keeps a path for retry that the current solution did NOT confirm: the page must not show it as
+        // the target. Every write of _exe is followed by a PushTarget, so the bar never shows a stale claim.
+        private TargetState _exeState = TargetState.None;
+        private string _exeNote;
 
         // The exact local file URI the WebView is expected to navigate to. Used to (a) gate _ready on the
         // navigation actually being our packaged page and (b) reject web messages from any other origin.
@@ -77,6 +103,7 @@ namespace ClarionDebugger.Terminal
         {
             BackColor = Color.FromArgb(30, 30, 30);
             Dock = DockStyle.Fill;
+            _editGrants = new EditGrants(() => _svc.Selection);
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
 
@@ -91,10 +118,12 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
             _svc.LibStateReceived      += OnSvcLibState;
+            _svc.MemReceived           += OnSvcMem;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
+            _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -102,10 +131,13 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError       += OnSvcBreakpointError;
             _svc.Traced                += OnSvcTraced;
             _svc.EngineError           += OnSvcEngineError;
+            _svc.SetIpResult           += OnSvcSetIpResult;
             _svc.ModuleLoaded          += OnSvcModuleLoaded;
             _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
             _svc.LogReceived           += OnSvcLog;
             _svc.Exited                += OnSvcExited;
+            _svc.Detached              += OnSvcDetached;
+            _svc.DetachAbandoned       += OnSvcDetachAbandoned;
 
             _gutter.GutterBreakpointAdded   += OnGutterAdded;
             _gutter.GutterBreakpointRemoved += OnGutterRemoved;
@@ -193,7 +225,7 @@ namespace ClarionDebugger.Terminal
                     // TryAutoResolveExe already announces a changed target and pushes it to the
                     // target bar; a second line here just said the same thing twice.
                     TryAutoResolveExe();
-                    if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                    ListProceduresForTarget();
                 }
                 catch (Exception ex)
                 {
@@ -203,7 +235,12 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Drop target/procedure state when the solution closes, so the pad never shows a list
-        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.</summary>
+        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.
+        /// <para>
+        /// A close MID-SESSION is left alone on purpose (0214f33a): the bar then names the binary being debugged,
+        /// which is still the truth about the session, and the procedures list is that binary's. The session's end
+        /// catches up - OnSvcStateChanged(Idle) re-resolves, finds no solution, and clears the target to "none".
+        /// </para></summary>
         private void ClearForClosedSolution()
         {
             UI(() =>
@@ -212,8 +249,8 @@ namespace ClarionDebugger.Terminal
                 {
                     if (CurrentState != DebugSessionState.Idle) return;
                     _exe = null; _exeAuto = false; _exeManualKey = null;
-                    _procGen++;                       // invalidate any in-flight procedure parse
-                    Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    _exeState = TargetState.None; _exeNote = ProjectTargetService.NoSolutionNote;
+                    ClearProcedures();
                     PushTarget();                     // blanks the target bar
                     Console("info", "solution closed — target cleared");
                 }
@@ -237,10 +274,12 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
             _svc.LibStateReceived       -= OnSvcLibState;
+            _svc.MemReceived            -= OnSvcMem;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
+            _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -248,10 +287,13 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError        -= OnSvcBreakpointError;
             _svc.Traced                 -= OnSvcTraced;
             _svc.EngineError            -= OnSvcEngineError;
+            _svc.SetIpResult            -= OnSvcSetIpResult;
             _svc.ModuleLoaded           -= OnSvcModuleLoaded;
             _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
             _svc.LogReceived            -= OnSvcLog;
             _svc.Exited                 -= OnSvcExited;
+            _svc.Detached               -= OnSvcDetached;
+            _svc.DetachAbandoned        -= OnSvcDetachAbandoned;
 
             _gutter.GutterBreakpointAdded   -= OnGutterAdded;
             _gutter.GutterBreakpointRemoved -= OnGutterRemoved;
@@ -284,43 +326,111 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        // The selection epoch is read HERE, on the thread that raised the event, so the clear retires what was issued
+        // before this resume and spares anything a newer stop has issued by the time the marshalled clear runs.
+        private void OnSvcResumed(string mode) { int epoch = _svc.Selection.Epoch; UI(() => { _editGrants.Resumed(epoch); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); }); }
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
-        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
+        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid, string reqId) => UI(() => OnStack(frames, tid, reqId));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
 
-        private void OnSvcModuleData(string module, string itemsJson, uint? tid) => UI(() =>
-            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        // Each of the three row replies GRANTS its editable rows before it posts them (afbc68c7): these are the
+        // rows whose address/type tuple the page may later send back in an edit, and EditVar honours only a
+        // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
+        // Only a reply to a moduledata the host sent in the current epoch may grant (3517fd15): one delayed past
+        // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
+        private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
+        {
+            bool mayGrant = _editGrants.ReadAnswered(reqId);
+            if (mayGrant) _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + RowsAsGranted(itemsJson, mayGrant) + "]" + TidJson(tid) + "}");
+        });
+
+        // The members that make a row editable on the page: the edit tuple the engine attaches, and EditVar checks.
+        private static readonly string[] EditTupleMembers = { "va", "typeCode", "size", "places" };
+
+        /// <summary>A row reply's items as the page may see them: verbatim when the host granted them, and WITHOUT
+        /// every row's edit tuple when it did not (3517fd15, codex security run 1). A row shown with a tuple the host
+        /// will refuse offers an edit pencil that only fails; "display only" has to be what the page is shown.
+        /// Nothing else is touched: "View memory" reads the row's own <c>addr</c>, and a reference row keeps what
+        /// <c>expand</c> needs. Text that is not well-formed is posted as no rows at all.</summary>
+        private static string RowsAsGranted(string itemsJson, bool granted)
+        {
+            if (granted || string.IsNullOrEmpty(itemsJson)) return itemsJson ?? "";
+            string all = JsonMessageReader.WithoutMembers("[" + itemsJson + "]", EditTupleMembers);
+            return all == null || all.Length < 2 ? "" : all.Substring(1, all.Length - 2);
+        }
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
-            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+        {
+            // Only a reply to an expand the host VERIFIED and forwarded may grant (afbc68c7): its rows are
+            // members of a group the host itself offered. Any other reply is posted for display, and grants
+            // nothing - its rows cannot be edited or expanded further.
+            bool verified = _editGrants.ExpandVerified(reqId);
+            if (verified) _editGrants.GrantRows(itemsJson, null);
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]}");
+        });
 
         private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
-            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        {
+            // Only a reply to a framelocals the host VERIFIED and forwarded may grant (49538b78 wave 5): its rows
+            // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
+            // posted for display, and grants nothing.
+            bool verified = _editGrants.FrameLocalsVerified(reqId, tid);
+            if (verified) _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]" + TidJson(tid) + "}");
+        });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        // Memory panel. Grants nothing: a dump is display only (see RequestMem's security note).
+        private void OnSvcMem(string reqId, string addr, int len, int read, string bytes, string error) => UI(() =>
+            Post("{\"type\":\"mem\",\"reqId\":" + Str(reqId) + ",\"addr\":" + Str(addr)
+                 + ",\"len\":" + len.ToString(CultureInfo.InvariantCulture) + ",\"read\":" + read.ToString(CultureInfo.InvariantCulture)
+                 + ",\"bytes\":" + Str(bytes) + ",\"error\":" + Str(error) + "}"));
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
+        // No handler clears the grants when the selection moves (a stop, a switch, an inventory that disagreed):
+        // the grant table observes the service's epoch on every call and retires itself (EditGrants.Sync, 3517fd15).
+        // The clears it replaced ran marshalled, behind a request the UI thread could bind first (debugger L2).
         // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
         // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
         // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
         // it had and re-asks 'threads' for the authoritative one.
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
+            // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
+            // The grant table has retired the old thread's rows by itself: the service moved the selection's epoch
+            // before raising this, and the table checks it on every call (EditGrants.Sync).
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
                                   + ": " + (error ?? "could not select"));
         });
+        // Hover mode (f6e547ce). Not thread-SCOPED: the tid names the thread under the cursor, so the page
+        // must not run it through tidAccepted. None is an absent tid, through TidJson like every tid.
+        private void OnSvcHover(uint? tid, bool on, bool paused) => UI(() =>
+        {
+            Post("{\"type\":\"hover\",\"on\":" + (on ? "true" : "false") + ",\"paused\":" + (paused ? "true" : "false")
+                + TidJson(tid) + "}");
+        });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
+        // be edited again (afbc68c7). A refusal the host makes itself goes through PostVarSet and re-issues
+        // nothing - it spent nothing.
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
+        {
+            _editGrants.Regrant(va);
+            PostVarSet(va, ok, value, error);
+        });
+
+        private void PostVarSet(string va, bool ok, string value, string error)
         {
             Post("{\"type\":\"varset\",\"va\":" + Str(va) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
-        });
+        }
+
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() =>
         {
             // Phase 2 of run-to-cursor: the transient is now confirmed armed, so it's safe to resume. There is
@@ -330,11 +440,11 @@ namespace ClarionDebugger.Terminal
             // later RemoveBreakpoint (OnPaused) matches engine truth even if the engine canonicalizes the module
             // name differently from the UI's curFile — no stranded, untracked one-shot.
             if (_pendingRtcKey != null && bp != null && bp.Module != null
-                && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
+                && (bp.DisplayLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
             {
                 _transientBps.Remove(_pendingRtcKey);
                 _pendingRtcKey = null;
-                _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
+                _transientBps.Add(TransientKey(bp.Module, bp.DisplayLine));   // engine-confirmed identity
                 SendBps();
                 if (CurrentState == DebugSessionState.Paused) _svc.Continue();
                 return;
@@ -342,7 +452,13 @@ namespace ClarionDebugger.Terminal
             SendBps();
         });
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
-        private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
+        private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() =>
+        {
+            // The list sent after a run-to-cursor cleanup's del: every echo of that add and that del came before it,
+            // so the key has nothing left to hide.
+            if (_rtcCleanupKey != null) { _transientBps.Remove(_rtcCleanupKey); _rtcCleanupKey = null; }
+            SendBps();
+        });
         private void OnSvcBreakpointError(string m, int l, string err) => UI(() =>
         {
             // A pending run-to-cursor transient the engine rejected (e.g. no resolvable code record): it never
@@ -350,12 +466,22 @@ namespace ClarionDebugger.Terminal
             // same reason as bp-set (one pending RTC; module spelling may be the engine's canonical form).
             if (_pendingRtcKey != null && l == _pendingRtcLine)
             {
-                _transientBps.Remove(_pendingRtcKey);
+                string key = _pendingRtcKey;
                 _pendingRtcKey = null;
                 Console("err", "run to cursor: " + m + ":" + l + " — " + err + " (could not arm; staying paused).");
+                // One image refused it; another may have armed it already, or be about to (1be3b82e, debugger LOW
+                // run 1). Remove every copy and keep the key tracked until that is settled, or a copy armed in
+                // another image would outlive the run as an untracked breakpoint. Nothing sent, nothing to settle.
+                int ci = key.LastIndexOf(':');
+                if (ci > 0 && _svc.RemoveBreakpoint(key.Substring(0, ci), l) && _svc.RequestBreakpointList())
+                    _rtcCleanupKey = key;
+                else
+                    _transientBps.Remove(key);
                 SendBps();
                 return;
             }
+            // Another image's refusal of the same add, or the cleanup del finding nothing to remove: not news.
+            if (_rtcCleanupKey != null && string.Equals(_rtcCleanupKey, TransientKey(m, l), StringComparison.OrdinalIgnoreCase)) return;
             Console("err", "breakpoint " + m + ":" + l + " — " + err);
         });
         private void OnSvcTraced(string m, int l, string msg, int hits) => UI(() => Console("trace", m + ":" + l + "  " + msg + "  (#" + hits + ")"));
@@ -364,13 +490,67 @@ namespace ClarionDebugger.Terminal
         // cannot act on. Nothing else in the page reads it today.
         private void OnSvcEngineError(string msg) => UI(() =>
         {
+            // An attach that failed says why in this error, and the engine exits right after it. The exit clears the
+            // page's console, so the reason is kept to be said again after that clear (see OnSvcExited).
+            if (_attach != null && msg != null && msg.StartsWith("attach ", StringComparison.Ordinal)) _attach.LastError = msg;
             Console("err", "engine: " + msg);
             Post("{\"type\":\"engineerror\",\"message\":" + Str(msg) + "}");
         });
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
-        private void OnSvcExited(int code) => UI(() => { _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+        private void OnSvcExited(int code) => UI(() =>
+        {
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; _rtcCleanupKey = null; ClearExecutionLine();
+            var attach = _attach;
+            _attach = null;
+            if (attach == null) { Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); return; }
+            // An ATTACH session (3f2d747f). After a detach, OnSvcDetached has already cleared the page and said the
+            // app is still running; clearing again here would wipe that line.
+            if (attach.Detached) return;
+            // Otherwise clear FIRST, since `clear` empties the console, and then say why: an attach that failed
+            // reported its reason just before the engine exited, and that line is gone with the clear.
+            Post("{\"type\":\"clear\"}");
+            if (attach.LastError != null) Console("err", "engine: " + attach.LastError);
+            Console("info", "— session ended (exit " + code + ") —");
+        });
+
+        /// <summary>The engine let the attached process go, and it keeps running (3f2d747f). The same reset as a
+        /// session end (OnSvcExited), then the one line the user needs - and a warning when a planted breakpoint
+        /// byte could not be restored, because the app will then hit an INT3 with no debugger and most likely crash.
+        /// The engine's exit follows; OnSvcExited sees <see cref="AttachContext.Detached"/> and leaves this alone.</summary>
+        private void OnSvcDetached(DebugDetach d) => UI(() =>
+        {
+            if (_attach != null) _attach.Detached = true;
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; _rtcCleanupKey = null; ClearExecutionLine();
+            Post("{\"type\":\"clear\"}");   // first: `clear` empties the console, and the lines below must survive it
+            string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name
+                        : !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";
+            // `restored` is a COUNT and informational; -1 = the engine did not say. The crash warning is driven
+            // ONLY by `error`, which the engine sets whenever any restore failed.
+            string count = d != null && d.Restored >= 0
+                ? " (" + d.Restored.ToString(CultureInfo.InvariantCulture) + " breakpoint" + (d.Restored == 1 ? "" : "s") + " restored)"
+                : "";
+            Console("info", "Detached; " + name + " is still running" + count + ".");
+            if (d != null && !string.IsNullOrEmpty(d.Error))
+                Console("err", "detach could not restore every breakpoint (" + d.Error + "): "
+                    + name + " will probably crash when it reaches one. Save your work in it and restart it.");
+        });
+
+        // Stop had to kill an attached engine (the page is live here; a closing pad is covered by TeardownObserver).
+        private void OnSvcDetachAbandoned(AttachableProcess t) => UI(() =>
+            Console("err", DetachWarningText(t != null ? t.Name : _lastAttachName, t != null ? (uint?)t.Pid : null,
+                "the engine did not detach in time and had to be killed, so breakpoints may still be planted")));
+
+        /// <summary>The one wording of an unsafe detach, for the console, the dialog and the log alike.</summary>
+        internal static string DetachWarningText(string name, uint? pid, string error)
+        {
+            string app = string.IsNullOrEmpty(name) ? "the app" : name;
+            return "CA Debugger could not detach cleanly from " + app
+                + (pid.HasValue ? " (pid " + pid.Value.ToString(CultureInfo.InvariantCulture) + ")" : "")
+                + ": " + (string.IsNullOrEmpty(error) ? "unknown error" : error)
+                + ". Save your work in " + app + " and restart it.";
+        }
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
@@ -522,10 +702,12 @@ namespace ClarionDebugger.Terminal
                     return;
                 }
 
-                string json = e.TryGetWebMessageAsString();
-                string action = JsonVal(json, "action");
-                string data = JsonVal(json, "data");
-                switch (action)
+                // Typed once, here: a message that is not a well-formed envelope is dropped whole. Each case
+                // below parses its own payload through the DTO in PageMessages.cs and drops a malformed one.
+                var msg = PageEnvelope.Parse(e.TryGetWebMessageAsString());
+                if (msg == null) return;
+                string data = msg.Data;
+                switch (msg.Action)
                 {
                     // The page also asks for About data whenever the panel is opened, so it reflects
                     // live state rather than a value captured once at startup. The push on "ready"
@@ -540,7 +722,7 @@ namespace ClarionDebugger.Terminal
                         PushAbout();
                         PushTarget();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
+                        ListProceduresForTarget();   // list procedures before running
                         break;
                     case "start": CmdStart(); break;
                     case "continue": CmdContinue(); break;
@@ -549,28 +731,23 @@ namespace ClarionDebugger.Terminal
                     case "stepinto": CmdStepInto(); break;
                     case "stepout": CmdStepOut(); break;
                     case "stop": CmdStop(); break;
+                    case "procs": CmdListProcs(); break;           // attach picker: list attachable processes
+                    case "attach": CmdAttach(data); break;         // data = a pid from the host's own last listing
                     case "watch":
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
+                    case "framelocals": FrameLocals(data); break;   // call-stack frame locals: data = "reqId|va|ebp"
+                    case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
+                        if (_svc.State == DebugSessionState.Paused)
                         {
-                            var a = data.Split('|');
-                            if (a.Length == 4 && int.TryParse(a[0], out int rq) && uint.TryParse(a[2], out uint tr))
-                                _svc.RequestExpand(rq, a[1], tr, a[3]);
-                        }
-                        break;
-                    case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
-                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
-                        {
-                            var a = data.Split('|');
-                            if (a.Length == 3 && int.TryParse(a[0], out int rq))
-                                _svc.RequestFrameLocals(rq, a[1], a[2]);
+                            var mr = MemRequest.Parse(data);
+                            if (mr != null) _svc.RequestMem(mr.ReqId, mr.Addr, mr.Len);
                         }
                         break;
                     case "libstate":   // per-thread Library State refresh: data = reqId
-                        if (_svc.State == DebugSessionState.Paused && int.TryParse(data, out int lrq))
+                        if (_svc.State == DebugSessionState.Paused && PageNumbers.TryInt(data, out int lrq))
                             _svc.RequestLibState(lrq);
                         break;
 
@@ -579,11 +756,13 @@ namespace ClarionDebugger.Terminal
                     // on screen. Each of these is paused-only; the engine refuses them otherwise anyway.
                     case "threads": if (_svc.State == DebugSessionState.Paused) _svc.RequestThreads(); break;
                     case "selectthread":
-                        if (_svc.State == DebugSessionState.Paused && uint.TryParse(data, out uint seltid))
+                        if (_svc.State == DebugSessionState.Paused && PageNumbers.TryUInt(data, out uint seltid))
                             _svc.SelectThread(seltid);
                         break;
-                    case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
-                    case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
+                    // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
+                    case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
+                    case "stack": if (_svc.State == DebugSessionState.Paused) RequestStack(); break;
+                    case "moduledata": if (_svc.State == DebugSessionState.Paused) RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
                     case "rewatch":
                         // Re-resolve EVERY watched name against the newly selected thread. Host-side rather
@@ -599,11 +778,12 @@ namespace ClarionDebugger.Terminal
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
                     case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
+                    case "setip": CmdSetNextStatement(data); break;    // move the stopped thread's IP to module:line
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
-                        else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
+                        if (!ListProceduresForTarget())
+                            Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
                         break;
                 }
             }
@@ -650,6 +830,113 @@ namespace ClarionDebugger.Terminal
             StartSession();
         }
 
+        /// <summary>The attach picker asked for the processes it may offer (3f2d747f). Listed off the UI thread by the
+        /// engine's one-shot <c>procs</c>, with this IDE's own pid excluded, and posted to the page as a
+        /// <c>procs</c> message. The listing is also what <see cref="CmdAttach"/> checks a pid against, so a
+        /// refresh retires the previous listing's pids AT ONCE, not when the new one arrives.</summary>
+        private void CmdListProcs()
+        {
+            int gen = ++_procsGen;
+            _listedProcs.Begin(gen);
+            int self;
+            try { self = System.Diagnostics.Process.GetCurrentProcess().Id; } catch { self = 0; }
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string error;
+                var procs = ClarionDebuggerService.ListProcesses(self, out error);
+                UI(() =>
+                {
+                    if (!_listedProcs.Replace(gen, procs)) return;   // a newer listing was asked for meanwhile
+                    Post(ProcsJson(procs, error));
+                });
+            });
+        }
+
+        /// <summary>The page's <c>procs</c> message. Names and paths are the processes' own, so they are written as
+        /// JSON strings here and rendered as TEXT by the page, never as markup.</summary>
+        private static string ProcsJson(List<AttachableProcess> procs, string error)
+        {
+            var sb = new StringBuilder("{\"type\":\"procs\",\"procs\":[");
+            if (procs != null)
+                for (int i = 0; i < procs.Count; i++)
+                {
+                    var p = procs[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"pid\":").Append(p.Pid.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"name\":").Append(Str(p.Name))
+                      .Append(",\"path\":").Append(Str(p.Path)).Append('}');
+                }
+            sb.Append("],\"error\":").Append(Str(error)).Append('}');
+            return sb.ToString();
+        }
+
+        /// <summary>Attach to the process the picker named (3f2d747f). <paramref name="data"/> is a pid, and it is
+        /// honoured ONLY when it is in the listing this host last sent (<see cref="ListedProcesses"/>): anything else
+        /// is dropped with a console line, so nothing on the bridge can point the debugger at an arbitrary process.
+        /// Gated like <see cref="CmdStart"/>: this pad idle AND the global controller idle.</summary>
+        public void CmdAttach(string data)
+        {
+            if (CurrentState != DebugSessionState.Idle) return;
+            if (DebugSessionController.State != DebugControllerState.Idle) return;
+            var req = AttachRequest.Parse(data);
+            if (req == null) { Console("err", "attach: dropped a request that did not name a process id"); return; }
+            var target = _listedProcs.Take(req.Pid);
+            if (target == null)
+            {
+                Console("err", "attach: pid " + req.Pid.ToString(CultureInfo.InvariantCulture)
+                    + " was not in the process list this pad last showed, so it was refused. Refresh the list and pick again.");
+                return;
+            }
+            // A pid is not an identity: without the listed start time the engine cannot check that pid still names
+            // the process the user picked, so the attach is refused rather than made blind (an older engine).
+            if (!AttachableProcess.IsStartTime(target.Started))
+            {
+                Console("err", "attach: the process list gave no start time for " + (target.Name ?? "the process") + " (pid "
+                    + req.Pid.ToString(CultureInfo.InvariantCulture) + "), so the debugger cannot prove that pid is still the process"
+                    + " you picked. It was not attached. The CA Debugger engine may be older than the add-in: reinstall it.");
+                return;
+            }
+            AttachSession(target);
+        }
+
+        /// <summary>Start an ATTACH session on <paramref name="target"/>: StartSession's steps, with the listed process
+        /// in place of a launched EXE.</summary>
+        private void AttachSession(AttachableProcess target)
+        {
+            try
+            {
+                RearmAndReportMonacoHooks();
+                if (_svc.IsEngineStillClosing) { Console("err", ClarionDebuggerService.EngineClosingMessage); return; }
+
+                MergeGutterIntoPending();
+                Post("{\"type\":\"clear\"}");
+                var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
+                string label = (target.Name ?? "process") + " (pid " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
+                Console("info", "attaching to " + label + SessionCounts(solutionDlls));
+                _attach = new AttachContext { Name = target.Name };
+                _lastAttachName = target.Name;
+                try { _svc.AttachSession(target, _pending.ToArray(), solutionDlls); }
+                catch { _attach = null; throw; }
+                // Stop now DETACHES; the page says so on its Stop control.
+                Post("{\"type\":\"attachmode\",\"on\":true}");
+
+                // Symbols come from the image on disk, as for a launch, when the listed path still resolves.
+                string exe = target.Path;
+                if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) LoadStaticSymbols(exe);
+            }
+            catch (Exception ex) { Console("err", "attach failed: " + ex.Message); }
+        }
+
+        /// <summary>What the pad knows about the attach session in progress (UI-thread only).</summary>
+        private sealed class AttachContext
+        {
+            public string Name;
+            /// <summary>The engine reported <c>detached</c>: the page has been told the app is still running.</summary>
+            public bool Detached;
+            /// <summary>The engine's "attach ..." error, said again after the exit clears the console.</summary>
+            public string LastError;
+        }
+
         public void CmdContinue() { if (CurrentState == DebugSessionState.Paused) _svc.Continue(); }
         public void CmdStepOver() { if (CurrentState == DebugSessionState.Paused) _svc.StepOver(); }
         public void CmdStepInto() { if (CurrentState == DebugSessionState.Paused) _svc.StepInto(); }
@@ -675,11 +962,10 @@ namespace ClarionDebugger.Terminal
                 spec = ResolveMonacoCursorSpec();
                 if (spec == null) return;   // ResolveMonacoCursorSpec already reported why to the console
             }
-            int c = spec.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = spec.Substring(0, c);
-            int line;
-            if (!int.TryParse(spec.Substring(c + 1), out line)) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
 
             // A persistent breakpoint on the SAME REQUESTED line is the only conflict: the engine collapses a
             // re-add at an identical requested line into a props-update (and removal is by requested line), so
@@ -692,7 +978,7 @@ namespace ClarionDebugger.Terminal
             //   • nothing on this requested line → plant the transient one-shot and continue.
             DebugBreakpoint exact = null;
             foreach (var b in _svc.Breakpoints)
-                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.RequestedLine == line) { exact = b; break; }
+                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.DisplayLine == line) { exact = b; break; }
 
             if (exact != null)
             {
@@ -713,6 +999,10 @@ namespace ClarionDebugger.Terminal
             // a "ran to cursor" that silently didn't. So: track the key now (filtered from the pane immediately,
             // and always cleaned up on pause/exit even if confirmation never comes), then defer Continue() to
             // OnSvcBreakpointSet; OnSvcBreakpointError aborts and stays paused.
+            // ARMED IN EVERY IMAGE (contract C3, 1be3b82e): a plain unqualified add, like a gutter dot. Several
+            // loaded images can carry a same-named .clw, and the host cannot tell which one the caret's file
+            // is compiled into; arming only the engine's first pick could run straight past the line the
+            // user pointed at. The stop - in whichever image - removes every copy (`bp del`, OnPaused).
             if (!_svc.AddBreakpoint(module, line))
             {
                 Console("err", "run to cursor: could not set a breakpoint at " + module + ":" + line + " — staying paused.");
@@ -727,37 +1017,35 @@ namespace ClarionDebugger.Terminal
 
         private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
 
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line. Paused
+        /// only, and an explicit module:line only (the pad's source-view menu); the engine decides whether the
+        /// move is safe. A refusal comes back through <see cref="OnSvcSetIpResult"/>; a success is followed by
+        /// an ordinary `paused` (reason "setip"), which <see cref="OnPaused"/> handles like any other stop.</summary>
+        public void CmdSetNextStatement(string spec)
+        {
+            if (CurrentState != DebugSessionState.Paused) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            if (!_svc.SetNextStatement(at.Module, at.Line))
+                Console("err", "set next statement: could not send the request for " + at.Module + ":" + at.Line + ".");
+        }
+
+        // The success line is logged here; the refresh itself rides on the `paused` that follows it. A refusal is
+        // logged and handed to the page, which shows the engine's sentence as is.
+        private void OnSvcSetIpResult(bool ok, string reason, string module, int line, string error) => UI(() =>
+        {
+            if (ok) Console("info", "set next statement: " + module + ":" + line);
+            else Console("err", "set next statement refused (" + reason + "): " + error);
+            Post("{\"type\":\"setip\",\"ok\":" + (ok ? "true" : "false") + ",\"reason\":" + Str(reason)
+                 + ",\"error\":" + Str(error) + ",\"module\":" + Str(module) + ",\"line\":" + line + "}");
+        });
+
         // ── Run to cursor sourced from the real Monaco editor ─────────────────────────────────────
         // "Wherever the developer's caret actually is right now", pulled from ClarionAssistant's live Monaco
         // cursor tracking (MonacoSourceNavigator.TryGetActiveCursor). This is the no-spec branch of
         // CmdRunToCursor, NOT a second command: one "run to cursor" concept, two ways to say where. The
         // eventual Monaco-side trigger (context menu / gutter click) needs no new plumbing here — it sends
         // the same "runtocursor" web message with no data.
-
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor.
-        private static MethodInfo _monacoCursor;
-
-        /// <summary>Resolve ClarionAssistant's live-cursor query, if that addin is loaded. Same reflection
-        /// pattern as ResolveMonacoNavigator (no compile-time reference between the two addins). Frozen
-        /// contract: bool ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor(out string filePath, out int line, out int column)</summary>
-        private static MethodInfo ResolveMonacoCursorGetter()
-        {
-            if (_monacoCursor != null) return _monacoCursor;
-            try
-            {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("TryGetActiveCursor", BindingFlags.Public | BindingFlags.Static);
-                    if (mi != null) { _monacoCursor = mi; break; }
-                }
-            }
-            catch { }
-            return _monacoCursor;
-        }
 
         /// <summary>Resolve "module:line" from the ACTIVE Monaco editor's live cursor, or null if there is no
         /// usable cursor — reporting WHY to the Debug Console in that case, since every failure here is
@@ -767,10 +1055,15 @@ namespace ClarionDebugger.Terminal
         /// name IS the module name — the same assumption EditorBreakpointService makes).</summary>
         private string ResolveMonacoCursorSpec()
         {
-            var mi = ResolveMonacoCursorGetter();
+            var mi = _hookCursor.Method;
             if (mi == null)
             {
-                Console("err", "run to cursor: ClarionAssistant isn't loaded — can't read the active editor's cursor.");
+                // Say WHICH failure this is. "Not loaded", "your ClarionAssistant predates the hook" and
+                // "the hook is there but its signature has drifted" are three different problems with three
+                // different fixes, and they are all invisible from the page. The third one in particular has
+                // no other way of ever being reported: every other caller treats an unbound hook as
+                // "ClarionAssistant isn't here" and quietly takes the native path.
+                Console("err", "run to cursor: " + _hookCursor.Explain() + " — can't read the active editor's cursor.");
                 return null;
             }
 
@@ -797,27 +1090,110 @@ namespace ClarionDebugger.Terminal
 
         /// <summary>Break on procedure entry: plant a normal (persistent) breakpoint at a procedure's
         /// definition line, surfaced from a right-click on a Procedures-pane row. Data is a JSON object
-        /// {name, module, line} — the row already carries module+line, so no re-resolution is needed. Running
-        /// or paused → push straight to the engine; idle → stage in _pending (deduped), exactly like a gutter
-        /// breakpoint. Deliberately does NOT touch the IDE gutter (no red dot), matching how _pending bps work.</summary>
+        /// {id} naming the row by the id <see cref="PushProcedures"/> sent it with; the module and line are
+        /// looked up HERE, in the table that push issued, never read from the page (afbc68c7). An id the
+        /// current list did not issue - a stale list, or one nobody listed - arms nothing and says so.
+        /// Running or paused → push straight to the engine; idle → stage in _pending (deduped), exactly like a
+        /// gutter breakpoint. Deliberately does NOT touch the IDE gutter (no red dot), matching how _pending
+        /// bps work.</summary>
         public void CmdBreakOnProcEntry(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            string module = JsonVal(data, "module");
-            if (string.IsNullOrEmpty(module)) return;
-            int line;
-            if (!int.TryParse(JsonVal(data, "line") ?? "", out line) || line <= 0) return;
-            string name = JsonVal(data, "name");
-
-            Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
-
-            if (_svc.IsRunning) _svc.AddBreakpoint(module, line);   // engine echoes bp-set → pane refresh
-            else
+            var req = BreakOnProcEntryRequest.Parse(data);
+            if (req == null) return;
+            var proc = _procIds.Resolve(req.ProcId);
+            if (proc == null)
             {
-                foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
-                SendBps();
+                Console("err", "break on entry: that procedure is not in the current list — refresh the Procedures pane and try again.");
+                return;
             }
+            string ignored;
+            BreakOnEntry(proc, out ignored);   // the pane's own Debug Console line is its whole answer
+        }
+
+        /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
+        /// name="line"/> - the editor cursor, reached from ClarionAssistant through
+        /// <see cref="DebugSessionController.BreakOnProcEntry"/> (e61e4f92). The position is ONLY a lookup key
+        /// into the list <see cref="PushProcedures"/> issued; which procedure it falls in, and where that one
+        /// starts, are the list's answer, exactly as with an id. The module is the file's name, the same
+        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).
+        /// Returns the outcome and a one-line message for ClarionAssistant's toast; the Debug Console gets
+        /// its line either way.</summary>
+        public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message)
+        {
+            string module = null;
+            try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
+            catch (ArgumentException) { module = null; }
+            string why;
+            var proc = _procIds.Containing(module, line, out why);
+            if (proc == null)
+            {
+                // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
+                return RefuseBreakOnEntry(why + " — nothing was set.",
+                    " (If the Procedures pane is empty, open the app's solution or refresh it.)", out message);
+            }
+            return BreakOnEntry(proc, out message);
+        }
+
+        /// <summary>The one body both break-on-entry paths share: validate, announce, then arm (live) or stage
+        /// (idle). Everything it knows about the procedure came from the host's own list. True when a
+        /// breakpoint was sent, staged or already staged; <paramref name="message"/> says which, or why
+        /// nothing was set.</summary>
+        private bool BreakOnEntry(ProcRef proc, out string message)
+        {
+            string module = proc.Module;
+            int line = proc.Line;
+            string name = proc.Name;
+            string label = (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line;
+            if (line <= 0)
+            {
+                return RefuseBreakOnEntry((string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.", "", out message);
+            }
+
+            // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
+            // the idle branch staged whatever module it was handed, so a name the engine would refuse sat
+            // in the pane as a breakpoint until the next Start silently dropped it (StartSession skips an
+            // invalid module).
+            if (!ClarionDebuggerService.IsValidModuleName(module))
+            {
+                return RefuseBreakOnEntry("not a module name the debugger can use: " + module, "", out message);
+            }
+
+            Console("info", "break on entry: " + label);
+
+            if (_svc.IsRunning)
+            {
+                // The engine echoes bp-set and the pane refreshes from that. A false return means the
+                // command never reached the engine, so no echo will ever come - and this used to be
+                // ignored, leaving the info line above as the only word on a breakpoint that was never
+                // armed. Say so instead.
+                if (!_svc.AddBreakpoint(module, line))
+                    return RefuseBreakOnEntry("could not set a breakpoint at " + module + ":" + line
+                        + " — the engine did not take the request.", "", out message);
+                // SENT, not confirmed: the bp-set echo is async, and a later refusal shows in the pad.
+                message = "Break on entry: " + label + " (sent to the debugger)";
+                return true;
+            }
+            foreach (var b in _pending)
+                if (SameBp(b, module, line))
+                {
+                    message = "Break on entry: " + label + " (already staged for the next Start)";
+                    return true;
+                }
+            _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
+            SendBps();
+            message = "Break on entry: " + label + " (staged for the next Start)";
+            return true;
+        }
+
+        /// <summary>A break-on-entry refusal: the Debug Console line it always wrote (plus
+        /// <paramref name="consoleTail"/>, a hint only the pad shows), and the same reason as the caller's
+        /// message. Always false.</summary>
+        private bool RefuseBreakOnEntry(string why, string consoleTail, out string message)
+        {
+            Console("err", "break on entry: " + why + consoleTail);
+            message = "Break on entry: " + why;
+            return false;
         }
 
         public void CmdPause()
@@ -831,8 +1207,9 @@ namespace ClarionDebugger.Terminal
             if (CurrentState == DebugSessionState.Idle) return;   // nothing to stop
             // Clear the execution-line marker (Monaco + native) on the UI thread (it's a UI operation).
             ClearExecutionLine();
-            // _svc.Stop() blocks (WaitForExit(1500) + Kill); run it off the UI thread so the IDE doesn't
-            // freeze. Results come back via the existing Exited/StateChanged -> UI() path.
+            // _svc.Stop() blocks (quit + WaitForExit + Kill; for an ATTACHED session detach + up to 8 s, so the app
+            // keeps running); run it off the UI thread so the IDE doesn't freeze. Results come back via the existing
+            // Exited/Detached/StateChanged -> UI() path.
             var svc = _svc;
             System.Threading.Tasks.Task.Run(() => { try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] stop: " + ex.Message); } });
         }
@@ -841,6 +1218,16 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
+                // Cross-addin hooks cache their MISSES for the whole session, so a ClarionAssistant that was
+                // absent (or older, or a mismatched build) when the last session started would stay "absent"
+                // for the life of the IDE process. A session start is the natural point to re-scan, and the
+                // only one worth paying for it at.
+                RearmAndReportMonacoHooks();
+
+                // The run just reported itself over, but its engine has not exited yet (0449e5c9): say so and
+                // stop here, before anything below announces a start that is not going to happen.
+                if (_svc.IsEngineStillClosing) { Console("err", ClarionDebuggerService.EngineClosingMessage); return; }
+
                 // The Target EXE field is intentionally gone — Start always sources the target from the app.
                 // On EVERY Start we re-resolve from the active project and use the fresh result. A manual Browse
                 // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
@@ -850,32 +1237,50 @@ namespace ClarionDebugger.Terminal
 
                 // Echo the resolved target so the console always confirms which process is about to launch.
                 Console("info", "target: " + _exe);
-                // merge gutter (red-dot) breakpoints set before launch
-                foreach (var gb in _gutter.Snapshot())
-                {
-                    bool known = false;
-                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.RequestedLine)) { known = true; break; }
-                    if (!known) _pending.Add(gb);
-                }
+                _attach = null;   // a launch: Stop quits (and ends the target) rather than detaching
+                MergeGutterIntoPending();
                 Post("{\"type\":\"clear\"}");
                 // Pre-load the solution's output DLLs so breakpoints set in DLL source bind before
                 // launch (multi-DLL apps); other DLLs are still picked up automatically as they load.
                 var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
-                Console("info", "starting: " + Path.GetFileName(_exe) + "  (" + _pending.Count + " breakpoint(s)"
-                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                Console("info", "starting: " + Path.GetFileName(_exe) + SessionCounts(solutionDlls));
                 _svc.StartSession(_exe, _pending.ToArray(), solutionDlls);
 
-                // load static data symbols (file buffers) for the Variables tree, off the UI thread
-                string exe = _exe;
-                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    string g = ClarionDebuggerService.GetGlobalsJson(exe);
-                    if (!string.IsNullOrEmpty(g))
-                        UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
-                });
-                PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
+                LoadStaticSymbols(_exe);
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>A session's static symbols, read from the image on disk for a launch and an attach alike
+        /// (70860d6b C7): the data symbols (file buffers) for the Variables tree, off the UI thread, and the
+        /// Procedures list against this target.</summary>
+        private void LoadStaticSymbols(string exe)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string g = ClarionDebuggerService.GetGlobalsJson(exe);
+                if (!string.IsNullOrEmpty(g))
+                    UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
+            });
+            PushProcedures(exe);
+        }
+
+        /// <summary>The "  (N breakpoint(s), M solution DLL(s))" a session's start line ends with.</summary>
+        private string SessionCounts(List<string> solutionDlls)
+        {
+            return "  (" + _pending.Count + " breakpoint(s)"
+                + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")";
+        }
+
+        /// <summary>Merge the gutter's (red-dot) breakpoints, set before the session, into _pending.</summary>
+        private void MergeGutterIntoPending()
+        {
+            foreach (var gb in _gutter.Snapshot())
+            {
+                bool known = false;
+                foreach (var b in _pending) if (SameBp(b, gb.Module, gb.DisplayLine)) { known = true; break; }
+                if (!known) _pending.Add(gb);
+            }
         }
 
         /// <summary>Enumerate the target's procedures + methods (static parse, off the UI thread) and send
@@ -887,18 +1292,30 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(exe)) return;
             _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
             int gen = ++_procGen;
+            // The old list's ids stop resolving NOW, not when the parse below finishes, and the page is told to
+            // drop them: a right-click in that window used to arm the PREVIOUS exe's row (codex adversary gate).
+            _procIds.Begin(gen);
+            Post("{\"type\":\"procedures\",\"procs\":[],\"loading\":true}");
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
                 {
                     var procs = ClarionDebuggerService.GetProcedures(exe);
+                    // Each row goes out with an id, and the table behind the ids goes live in the SAME UI step
+                    // that posts the list, so the page can never hold an id the host cannot resolve (short of
+                    // a newer list replacing it, which is the point).
+                    var ids = ProcedureIds.NewTable();
                     var sb = new StringBuilder();
                     sb.Append("{\"type\":\"procedures\",\"procs\":[");
                     for (int i = 0; i < procs.Count; i++)
                     {
                         var p = procs[i];
+                        string id = ProcedureIds.IdFor(gen, i);
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine,
+                                                 ExtentUnknown = p.ExtentUnknown };
                         if (i > 0) sb.Append(',');
-                        sb.Append("{\"name\":").Append(Str(p.Name))
+                        sb.Append("{\"id\":").Append(Str(id))
+                          .Append(",\"name\":").Append(Str(p.Name))
                           .Append(",\"module\":").Append(Str(p.Module))
                           .Append(",\"line\":").Append(p.Line)
                           .Append(",\"kind\":").Append(Str(p.Kind))
@@ -906,14 +1323,15 @@ namespace ClarionDebugger.Terminal
                     }
                     sb.Append("]}");
                     string json = sb.ToString();
-                    UI(() => { if (gen == _procGen) Post(json); });   // ignore an out-of-date parse — a newer push won
+                    // ignore an out-of-date parse — a newer push won, and its table with it
+                    UI(() => { if (gen == _procGen && _procIds.Replace(gen, ids)) Post(json); });
                 }
                 catch { }
             });
         }
 
         /// <summary>
-        /// Decide the target EXE for a Start. Always prefers a FRESH ProjectTargetService.ResolveTargetExe()
+        /// Decide the target EXE for a Start. Always prefers a FRESH ProjectTargetService.ResolveTarget()
         /// against the active project. A manual Browse pick is reused only if the IDE context (solution+project)
         /// is unchanged AND the file still exists; otherwise the stale manual pick is discarded. When nothing
         /// auto-resolves, falls back to a one-shot Browse tied to the current context. Returns true if _exe is a
@@ -925,15 +1343,21 @@ namespace ClarionDebugger.Terminal
             try { ctx = ProjectTargetService.GetActiveContextKey(); } catch { }
 
             // 1) Always re-resolve from the active project first — this is the primary source of truth.
-            string fresh = null;
-            try { fresh = ProjectTargetService.ResolveTargetExe(); } catch { }
+            ProjectTargetService.TargetResolution r = null;
+            try { r = ProjectTargetService.ResolveTarget(); } catch { }
+            string fresh = r != null ? r.Path : null;
+            string why = r != null ? r.Note : null;
             if (!string.IsNullOrEmpty(fresh))
             {
                 if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase) || _exeAuto == false)
                     Console("info", "resolved target: " + Path.GetFileName(fresh));
+                bool listed = IsListedTarget(fresh);
                 _exe = fresh;
                 _exeAuto = true;
                 _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
+                _exeState = TargetState.Auto; _exeNote = null;
+                PushTarget();
+                if (!listed) ListProceduresForTarget();   // a list emptied while unconfirmed comes back, even if Start stops here
                 if (File.Exists(_exe)) return true;
                 Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
                 return BrowseForContext(ctx);
@@ -948,11 +1372,17 @@ namespace ClarionDebugger.Terminal
                 // Context changed (or unconfirmable) — never launch a hidden EXE against a different solution.
                 Console("err", "Previously chosen target no longer matches the active solution — choose a target to launch.");
                 _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = why;
+                PushTarget();
                 return BrowseForContext(ctx);
             }
 
-            // 3) Nothing to launch — offer a one-shot Browse.
+            // 3) Nothing to launch — offer a one-shot Browse. An older auto path is kept for the next retry but is
+            //    no longer this solution's target, so the bar stops presenting it as one before the dialog opens.
             Console("err", "Could not auto-detect a Target EXE for the current solution — choose one to launch.");
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = why;
+            PushTarget();
             return BrowseForContext(ctx);
         }
 
@@ -962,7 +1392,14 @@ namespace ClarionDebugger.Terminal
         {
             if (!Browse()) return false;
             _exeManualKey = ctx;               // one-shot: only valid while the active context stays this
-            if (!File.Exists(_exe)) { Console("err", "Chosen target does not exist: " + _exe); _exe = ""; _exeManualKey = null; return false; }
+            if (!File.Exists(_exe))
+            {
+                Console("err", "Chosen target does not exist: " + _exe);
+                _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = "The chosen EXE does not exist";
+                PushTarget();
+                return false;
+            }
             return true;
         }
 
@@ -975,20 +1412,80 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
-                string result = ProjectTargetService.ResolveTargetExe();
-                if (!string.IsNullOrEmpty(result))
+                var r = ProjectTargetService.ResolveTarget();
+                if (r == null) return;   // defensive: ResolveTarget catches everything and returns a resolution, but a null would otherwise throw here
+                if (!string.IsNullOrEmpty(r.Path))
                 {
                     // Log only on an actual change. This runs on every IDE context event, and
                     // re-announcing the same unchanged target each time was pure console noise.
-                    bool changed = !string.Equals(_exe, result, StringComparison.OrdinalIgnoreCase);
-                    _exe = result;
+                    bool changed = !string.Equals(_exe, r.Path, StringComparison.OrdinalIgnoreCase);
+                    _exe = r.Path;
                     _exeAuto = true;
                     _exeManualKey = null;
+                    _exeState = TargetState.Auto; _exeNote = null;
                     if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
                     PushTarget();
+                    return;
                 }
+                // NO TARGET FROM THE SOLUTION (0214f33a). This returned silently, and whatever path the bar held -
+                // an older solution's auto target - went on looking like this solution's. Now the bar says so.
+                ApplyNoTarget(r.Outcome, r.Note, SafeContextKey());
+                PushTarget();
             }
             catch { }
+        }
+
+        /// <summary>What a resolve that found no target does to the one the pad holds. No solution open: the target
+        /// is gone ("none"). Otherwise a manual pick made for THIS solution context stays manual; any other path is
+        /// kept for a retry but UNCONFIRMED; with no path at all the state is "none". The note says why.</summary>
+        private void ApplyNoTarget(ProjectTargetService.TargetOutcome outcome, string note, string ctx)
+        {
+            if (outcome == ProjectTargetService.TargetOutcome.NoSolution)
+            {
+                _exe = ""; _exeAuto = false; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = note;
+                return;
+            }
+            bool manualHere = !_exeAuto && !string.IsNullOrEmpty(_exe) && ctx != null
+                              && string.Equals(ctx, _exeManualKey, StringComparison.OrdinalIgnoreCase);
+            if (manualHere) { _exeState = TargetState.Manual; _exeNote = null; return; }
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = note;
+        }
+
+        private static string SafeContextKey()
+        {
+            try { return ProjectTargetService.GetActiveContextKey(); } catch { return null; }
+        }
+
+        /// <summary>List the procedures of the target, but only of one the solution CONFIRMED (auto or manual): an
+        /// unconfirmed path is not this solution's target, and neither is its procedure list. Otherwise the list is
+        /// emptied. True when a list was asked for.</summary>
+        private bool ListProceduresForTarget()
+        {
+            if (!string.IsNullOrEmpty(_exe) && (_exeState == TargetState.Auto || _exeState == TargetState.Manual))
+            {
+                PushProcedures(_exe);
+                return true;
+            }
+            ClearProcedures();
+            return false;
+        }
+
+        /// <summary>True when the Procedures list already belongs to <paramref name="exe"/>: it is the confirmed target
+        /// now, so the list was pushed for it (ListProceduresForTarget), and relisting would only parse it again.</summary>
+        private bool IsListedTarget(string exe)
+        {
+            return (_exeState == TargetState.Auto || _exeState == TargetState.Manual)
+                && string.Equals(_exe, exe, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Empty the Procedures list, retiring every id the old one was sent with.</summary>
+        private void ClearProcedures()
+        {
+            _procGen++;                       // invalidate any in-flight procedure parse
+            _procIds.Clear();                 // and every id the old list was sent with
+            Post("{\"type\":\"procedures\",\"procs\":[]}");
         }
 
         /// <summary>
@@ -1001,7 +1498,28 @@ namespace ClarionDebugger.Terminal
             string path = _exe ?? string.Empty;
             bool exists = false;
             try { exists = path.Length > 0 && File.Exists(path); } catch { }
-            Post("{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false") + "}");
+            Post(TargetJson(path, exists, _exeState, _exeNote));
+        }
+
+        /// <summary>What the target bar may claim (contract C4). None is not a pad state of its own: it is exactly
+        /// "no path", so a path is never sent as "none" and no path is ever sent as anything else.</summary>
+        internal enum TargetState { None, Auto, Manual, Unconfirmed }
+
+        internal const int TargetNoteMax = 200;
+
+        /// <summary>The page's <c>target</c> message (contract C4): <c>state</c> always, <c>note</c> LAST and only when
+        /// there is one - a single plain-text line of at most <see cref="TargetNoteMax"/> characters.</summary>
+        internal static string TargetJson(string path, bool exists, TargetState state, string note)
+        {
+            path = path ?? "";
+            string s = path.Length == 0 ? "none"
+                     : state == TargetState.Auto ? "auto"
+                     : state == TargetState.Manual ? "manual"
+                     : "unconfirmed";   // a path whose state says None was never confirmed either
+            string n = note == null ? null : note.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (n != null && n.Length > TargetNoteMax) n = n.Substring(0, TargetNoteMax);
+            return "{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false")
+                 + ",\"state\":\"" + s + "\"" + (string.IsNullOrEmpty(n) ? "" : ",\"note\":" + Str(n)) + "}";
         }
 
         /// <summary>Shows the target EXE in File Explorer, with the file selected.</summary>
@@ -1057,8 +1575,12 @@ namespace ClarionDebugger.Terminal
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    bool listed = IsListedTarget(dlg.FileName);
                     _exe = dlg.FileName;
                     _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
+                    _exeState = TargetState.Manual; _exeNote = null;
+                    PushTarget();
+                    if (!listed) ListProceduresForTarget();
                     return true;
                 }
             }
@@ -1067,11 +1589,10 @@ namespace ClarionDebugger.Terminal
 
         private void Jump(string spec)
         {
-            if (string.IsNullOrEmpty(spec)) return;
-            int c = spec.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = spec.Substring(0, c);
-            int line; if (!int.TryParse(spec.Substring(c + 1), out line)) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
             string path = ResolvePath(module);
             if (path != null) NavigateTo(path, line);
             else Console("info", "(can't resolve " + module + " — open the app's solution so the .red is active)");
@@ -1081,12 +1602,10 @@ namespace ClarionDebugger.Terminal
         /// gutter gave us (no fragile re-resolution). Data is "line\tfullPath".</summary>
         private void OpenBp(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            int t = data.IndexOf('\t');
-            if (t <= 0) return;
-            int line;
-            if (!int.TryParse(data.Substring(0, t), out line)) return;
-            string path = data.Substring(t + 1);
+            var req = OpenBpRequest.Parse(data);
+            if (req == null) return;
+            int line = req.Line;
+            string path = req.Path;
             if (!string.IsNullOrEmpty(path) && File.Exists(path)) NavigateTo(path, line);
             else Console("info", "(can't open " + path + " — file not found)");
         }
@@ -1094,17 +1613,48 @@ namespace ClarionDebugger.Terminal
         /// <summary>Remove a breakpoint from the pane's "x". Removes the IDE gutter bookmark, which
         /// cascades through BreakPointRemoved → OnGutterBpRemoved (engine/pending + pane refresh) and
         /// clears the editor's red dot. Falls back to a direct removal if no bookmark is found (e.g. a
-        /// pending bp whose editor was closed). Data is "module:line".</summary>
+        /// pending bp whose editor was closed). Data is "module:line".
+        /// <para>
+        /// The page can only name the breakpoint the way the engine does, by bare .clw basename, so this
+        /// resolves the row's FILE before touching the gutter - through the same path map SendBps built
+        /// the row from, so the file removed is the file the row's link would have opened. Without it,
+        /// two DLLs each holding a same-named .clw bookmarked at the same line meant the "x" cleared
+        /// whichever bookmark the IDE enumerated first (task e80072f1). A null path here is not a
+        /// failure: it is the map saying it cannot tell, and RemoveByModuleLine then removes a lone
+        /// bookmark and declines an ambiguous one.
+        /// </para></summary>
         private void RemoveBp(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            int c = data.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = data.Substring(0, c);
-            int line;
-            if (!int.TryParse(data.Substring(c + 1), out line)) return;
-            if (!_gutter.RemoveByModuleLine(module, line))
+            var at = ModuleLineRequest.Parse(data);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
+            if (!_gutter.RemoveByModuleLine(module, line, PaneBpPath(module, line)))
                 OnGutterBpRemoved(module, line); // no gutter bookmark matched — keep the pane/engine consistent
+        }
+
+        /// <summary>The .clw path of the pane row the page is naming, or null when there is none to
+        /// trust. Reads the same list SendBps rendered and resolves it through the same map, so the
+        /// pane, its filename link and its "x" can never disagree about which file a row means.</summary>
+        private string PaneBpPath(string module, int line)
+        {
+            try
+            {
+                var paths = GutterPathsByModuleLine();
+                foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
+                    if (SameBp(b, module, line))
+                    {
+                        // The STATE is deliberately discarded here: ambiguous and unknown both mean "I
+                        // cannot name a file", and RemoveByModuleLine already treats a null path as
+                        // "match on module:line, and decline if several bookmarks do". The distinction
+                        // exists for the PAGE, which renders the two differently; the removal path has
+                        // only one sensible behaviour for both.
+                        BpPathState ignored;
+                        return GutterPathFor(paths, b, out ignored);
+                    }
+            }
+            catch { }
+            return null;
         }
 
         /// <summary>Apply advanced breakpoint properties (condition / hit count / tracepoint) from the
@@ -1114,16 +1664,15 @@ namespace ClarionDebugger.Terminal
         /// are re-applied via the launch spec; on a live session they are pushed to the engine immediately.</summary>
         private void SetBpProps(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            string module = JsonVal(data, "module");
-            if (string.IsNullOrEmpty(module)) return;
-            int line;
-            if (!int.TryParse(JsonVal(data, "line") ?? "", out line)) return;
+            var req = BpPropsRequest.Parse(data);
+            if (req == null) return;
+            string module = req.Module;
+            int line = req.Line;
 
-            string condition = JsonVal(data, "condition");
-            string hitMode = JsonVal(data, "hitMode");
-            int hitValue; int.TryParse(JsonVal(data, "hitValue") ?? "0", out hitValue);
-            string trace = JsonVal(data, "trace");
+            string condition = req.Condition;
+            string hitMode = req.HitMode;
+            int hitValue = req.HitValue;
+            string trace = req.Trace;
 
             // normalize empties to null = "no such property"
             if (string.IsNullOrWhiteSpace(condition)) condition = null;
@@ -1135,7 +1684,7 @@ namespace ClarionDebugger.Terminal
             foreach (var b in _pending) if (SameBp(b, module, line)) { target = b; break; }
             if (target == null)
             {
-                target = new DebugBreakpoint { Module = module, RequestedLine = line, Line = line };
+                target = new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line };
                 _pending.Add(target);
             }
             target.Condition = condition;
@@ -1153,13 +1702,23 @@ namespace ClarionDebugger.Terminal
         {
             UI(() =>
             {
+                // A new stop: nothing on screen is current any more, and the replies requested below re-grant
+                // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
+                // the selected one; the service has already moved its selection there, with a new epoch - and
+                // that retires every old grant, offer and outstanding request the moment the table is next
+                // touched, which is the first request below at the latest (EditGrants.Sync, 3517fd15).
+
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
+                // A `paused` with reason "setip" (set next statement) lands here too and cancels a run-to-cursor
+                // still waiting for its bp-set. That is intended: the user moved the IP after asking to run, so
+                // the pending run is moot, and it is not resumed behind their back.
                 if (_transientBps.Count > 0)
                 {
                     foreach (var key in new List<string>(_transientBps))
                     {
+                        if (string.Equals(key, _rtcCleanupKey, StringComparison.OrdinalIgnoreCase)) continue;   // its del is already sent
                         int ci = key.LastIndexOf(':');
                         if (ci <= 0) continue;
                         int tl;
@@ -1168,6 +1727,7 @@ namespace ClarionDebugger.Terminal
                     }
                     _transientBps.Clear();
                     _pendingRtcKey = null;   // defensive: any in-flight run-to-cursor is now moot (we've stopped)
+                    _rtcCleanupKey = null;
                     // Resync the pane from engine truth. A transient can snap onto the SAME planted address as a
                     // real breakpoint at a different requested line; the engine ref-counts the INT3 and keeps the
                     // real bp armed, but its bp-del echo carries only the planted line, and the host bp mirror
@@ -1184,9 +1744,13 @@ namespace ClarionDebugger.Terminal
                 Post(sb.ToString());
                 Console("pause", "paused [" + p.Reason + "]  " + (p.Resolved ? p.Module + " line " + p.Line + (p.Proc != null ? " in " + p.Proc : "") : "(unresolved)"));
 
-                SendSource(p.ResolvedPath, p.Proc, p.Line);
-                _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
-                _svc.RequestModuleData();
+                // The module goes in as well as the path: when the path does not resolve there is still a
+                // source message, carrying the module so the page can name the stop and clear the last one's
+                // listing instead of leaving it on screen.
+                NoteStopSource(p);
+                SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
+                RequestStack();               // per-frame locals now load lazily from the Call Stack (frame 0 auto)
+                RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
                 _svc.RequestThreads();
@@ -1196,7 +1760,7 @@ namespace ClarionDebugger.Terminal
                 // panel refresh above, but DON'T jump the editor to the .clw — that activates the source
                 // tab and steals focus away from the disassembly view on every instruction step.
                 bool instrStep = string.Equals(p.Reason, "stepi", StringComparison.OrdinalIgnoreCase);
-                var execLine = ResolveMonacoExecutionLine();
+                var execLine = _hookExecLine.Method;
                 if (execLine != null)
                 {
                     // ClarionAssistant can paint the execution line itself (issue #26).
@@ -1205,7 +1769,7 @@ namespace ClarionDebugger.Terminal
                 else if (!instrStep && !string.IsNullOrEmpty(p.ResolvedPath))
                 {
                     // No SetExecutionLine hook (ClarionAssistant absent or an older build): unchanged path.
-                    TryJump(p.ResolvedPath, p.Line);
+                    JumpToLine(p.ResolvedPath, p.Line);
                     // JumpToCurrentLine activates the Clarion editor and grabs keyboard focus, so the
                     // next configured debug shortcut would be handled by the editor instead of this
                     // pane. Return focus to our pad so stepping shortcuts keep working in a loop.
@@ -1215,7 +1779,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Pause-time execution-line marker when ClarionAssistant exposes SetExecutionLine.
-        /// Navigation still goes through <see cref="TryJump"/> (skipped for a 'stepi' instruction step so
+        /// Navigation still goes through <see cref="JumpToLine"/> (skipped for a 'stepi' instruction step so
         /// the Disassembly view keeps focus); the marker itself is Monaco's when it reports it painted one.
         /// When it returns false (overlay OFF) or throws, the stock editor's native marker is painted
         /// instead, which also fixes the pre-#26 overlay-off case where no marker appeared at all. An
@@ -1224,20 +1788,19 @@ namespace ClarionDebugger.Terminal
         {
             if (string.IsNullOrEmpty(path)) { ClearExecutionLine(); return; }
 
-            bool nativeJumped = false;
-            if (!instrStep) nativeJumped = TryJump(path, line);
+            bool nativeMarkerPainted = false;
+            if (!instrStep) nativeMarkerPainted = JumpToLine(path, line);
 
             bool painted = InvokeExecutionLine(setter, path, line);
             if (painted)
             {
-                // Monaco owns the marker. If the navigator declined and TryJump fell back to the stock
+                // Monaco owns the marker. If the navigator declined and JumpToLine fell back to the stock
                 // editor, drop the native arrow it painted so there is only ever one marker.
-                if (nativeJumped) ClearCurrentLineMarker();
+                if (nativeMarkerPainted) ClearCurrentLineMarker();
             }
-            else if (!instrStep && !nativeJumped)
+            else if (!instrStep && !nativeMarkerPainted)
             {
-                try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
-                catch { }
+                PaintNativeMarker(path, line);
             }
 
             if (!instrStep) ReturnFocusToPad();
@@ -1249,12 +1812,41 @@ namespace ClarionDebugger.Terminal
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
         private static string TidJson(uint? tid)
         {
-            // 0 is treated as "unknown" too, not written out: no Win32 thread has id 0, so a 0 reaching here
-            // is a caller that turned an absent tid into a sentinel — which the page would then read as a
-            // real thread and start dropping good replies against. Enforcing it here rather than trusting
-            // every caller is the point; the engine's own writer does the same on its side.
-            if (!tid.HasValue || tid.Value == 0) return string.Empty;
-            return ",\"tid\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
+            return TidMember(TidMemberTid, tid);
+        }
+
+        // The host's thread-id-valued member names, declared once (c299aced). tools/test-host-tid-members.ps1
+        // READS this array, so a name added here comes under its scan automatically, and it fails any host
+        // source that writes one of these as JSON text instead of passing it to TidMember - the same
+        // structure the engine side has had since 3b043dfc. `stopped` and `selected` are also the names of
+        // two per-row BOOLEANS in OnThreads; the scanner tells them apart by the value, not the name.
+        private const string TidMemberTid = "tid";
+        private const string TidMemberStopped = "stopped";
+        private const string TidMemberSelected = "selected";
+        private static readonly string[] TidValuedMemberNames = { TidMemberTid, TidMemberStopped, TidMemberSelected };
+
+        /// <summary>THE host's one writer of a thread-id-valued member, whatever the member is called.
+        /// Writes <paramref name="name"/> only when the id is KNOWN, and nothing at all when it is not.
+        /// <para>
+        /// 0 is treated as "unknown" too, not written out: no Win32 thread has id 0, so a 0 reaching here
+        /// is a caller that turned an absent tid into a sentinel — which the page would then read as a
+        /// real thread and start dropping good replies against. Enforcing it here rather than trusting
+        /// every caller is the point; the engine's own writer does the same on its side.
+        /// </para>
+        /// <para>
+        /// It takes the NAME because a thread id does not stop being one when it is called something else.
+        /// The <c>threads</c> message carries three of them — <c>tid</c> per row, plus a top-level
+        /// <c>stopped</c> and <c>selected</c> — and the two that are not called "tid" were written
+        /// unconditionally, so they said "thread 0" where they meant "I do not know" (task 3b043dfc).
+        /// The page already reads a non-number or a 0 as no selection, so an omitted member is the shape
+        /// it was waiting for.
+        /// </para></summary>
+        private static string TidMember(string name, uint? tid)
+        {
+            System.Diagnostics.Debug.Assert(Array.IndexOf(TidValuedMemberNames, name) >= 0,
+                "TidMember was handed an undeclared name; add it to TidValuedMemberNames");
+            if (!WireRules.TidIsKnown(tid)) return string.Empty;
+            return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
 
         /// <summary>Push the engine's thread inventory to the page (Call Stack thread picker). Names come from
@@ -1262,15 +1854,24 @@ namespace ClarionDebugger.Terminal
         private void OnThreads(DebugThreadList list)
         {
             if (list == null) return;
-            var sb = new StringBuilder("{\"type\":\"threads\",\"stopped\":").Append(list.StoppedTid)
-                .Append(",\"selected\":").Append(list.SelectedTid).Append(",\"threads\":[");
+            // Both go through the one writer, so an unknown stopped/selected is ABSENT rather than the
+            // thread-0 it used to claim to be — the same rule the per-row tid has always had here.
+            var sb = new StringBuilder("{\"type\":\"threads\"")
+                .Append(TidMember(TidMemberStopped, list.StoppedTid))
+                .Append(TidMember(TidMemberSelected, list.SelectedTid))
+                .Append(",\"threads\":[");
             for (int i = 0; i < list.Threads.Count; i++)
             {
                 var t = list.Threads[i];
                 if (i > 0) sb.Append(',');
-                sb.Append("{\"tid\":").Append(t.Tid)
-                  .Append(",\"clarionThread\":").Append(t.ClarionThread.HasValue
+                // The row's own tid goes through the one writer too (c299aced). It used to be typed inline as
+                // `{"tid":` + t.Tid, which is correct only while every row has a real id; the writer makes
+                // that a rule rather than a fact about the parser (which, as of 2026-09-22, drops a row with no
+                // tid). clarionThread opens the row because TidMember writes a leading comma - the page reads
+                // members by key, so order is free.
+                sb.Append("{\"clarionThread\":").Append(t.ClarionThread.HasValue
                         ? t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture) : "null")
+                  .Append(TidMember(TidMemberTid, t.Tid))
                   .Append(",\"proc\":").Append(Str(t.Proc))
                   .Append(",\"module\":").Append(Str(t.Module))
                   .Append(",\"line\":").Append(t.Line)
@@ -1299,15 +1900,36 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(name)) return;
             string why = null;
             if (!ClarionDebuggerService.IsValidWatchName(name))
-                why = "not a data name the debugger can read — letters, digits and _ : $ . only, up to 128 characters";
-            else if (!_svc.Watch(name))
-                why = "the engine did not accept the request";
+                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ - only, up to 128 characters";
+            else
+            {
+                // Under a fresh id, recorded once sent: only a reply echoing it may grant its row (OnWatch).
+                string id = _editGrants.NewRequestId();
+                if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);
+                else why = "the engine did not accept the request";
+            }
             if (why == null) return;
             Post("{\"type\":\"watch\",\"name\":" + Str(name) + ",\"found\":false,\"outOfScope\":false,\"error\":"
                 + Str(why) + "}");
         }
 
-        private void OnStack(List<DebugStackFrame> frames, uint? tid)
+        /// <summary>Ask the engine for the selected thread's stack under a fresh request id, recorded for the
+        /// current epoch once sent: only a reply echoing a recorded id may offer frames (EditGrants.OfferFrames).</summary>
+        private void RequestStack()
+        {
+            string id = _editGrants.NewRequestId();
+            if (_svc.RequestStack(id)) _editGrants.StackRequested(id);
+        }
+
+        /// <summary>Ask the engine for the module-scope data under a fresh request id, recorded for the current epoch
+        /// once sent: only a reply echoing a recorded id may grant its rows (OnSvcModuleData, 3517fd15).</summary>
+        private void RequestModuleData()
+        {
+            string id = _editGrants.NewRequestId();
+            if (_svc.RequestModuleData(id)) _editGrants.ReadRequested(id);
+        }
+
+        private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)
         {
             var sb = new StringBuilder("{\"type\":\"stack\",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
@@ -1324,24 +1946,44 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false").Append('}');
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
+            // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals), and
+            // only when this reply is for the selected thread and echoes a request id of this epoch (OfferFrames).
+            var offered = new List<KeyValuePair<string, string>>();
+            foreach (var f in frames) offered.Add(new KeyValuePair<string, string>(f.Va, f.Ebp));
+            _editGrants.OfferFrames(tid, reqId, offered);
             Post(sb.ToString());
+            FollowSelectedThread(frames, tid);
         }
 
         private void OnWatch(DebugWatch w)
         {
             var sb = new StringBuilder("{\"type\":\"watch\",\"name\":").Append(Str(w.Name))
                 .Append(",\"found\":").Append(w.Found ? "true" : "false");
+            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do, and
+            // only when it answers a watch this host sent in the current epoch (3517fd15). A miss answers its
+            // request too, so the id is spent on either outcome; a reply with no id is shown and grants nothing.
+            bool mayGrant = _editGrants.ReadAnswered(w.ReqId);
+            if (w.Found && mayGrant) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
             if (w.Found)
+            {
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))
-                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false")
-                  // edit-variable-value metadata so the Watch value cell can be written back
-                  .Append(",\"va\":").Append(Str(w.Va))
-                  .Append(",\"typeCode\":").Append(Str(w.TypeCode))
-                  .Append(",\"size\":").Append(w.Size)
-                  .Append(",\"places\":").Append(w.Places)
-                  // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
-                  .Append(",\"note\":").Append(Str(w.Note));
+                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false");
+                // edit-variable-value metadata so the Watch value cell can be written back - ONLY when this reply
+                // granted it (3517fd15, codex security run 1). Sent for a reply that granted nothing, it put an edit
+                // pencil on a value the host then refused: "display only" has to be what the page is shown.
+                if (mayGrant)
+                    sb.Append(",\"va\":").Append(Str(w.Va))
+                      .Append(",\"typeCode\":").Append(Str(w.TypeCode))
+                      .Append(",\"size\":").Append(w.Size)
+                      .Append(",\"places\":").Append(w.Places);
+                // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
+                sb.Append(",\"note\":").Append(Str(w.Note))
+                  // "View memory" address (own storage only) and the caller frame a local resolved in
+                  .Append(",\"addr\":").Append(Str(w.Addr))
+                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(CultureInfo.InvariantCulture) : "null")
+                  .Append(",\"frameProc\":").Append(Str(w.FrameProc));
+            }
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
                 // a name that resolved but could not be read (error) — all three must clear the row's pending state
@@ -1353,23 +1995,112 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Edit-variable-value: the page asked to write a new value into a live variable. Data is a
-        /// JSON object {va, typeCode, size, places, value} carried from the row's own metadata. Only valid
+        /// JSON object {va, typeCode, size, places, tid, value} carried from the row's own metadata. Only valid
         /// while paused; the service validates va/typeCode as hex and base64-encodes the value. The result
-        /// comes back via <see cref="OnSvcVariableSet"/>.</summary>
+        /// comes back via <see cref="OnSvcVariableSet"/>.
+        /// <para>
+        /// Only <c>value</c> is the user's. The other five decide WHERE and HOW the write lands, and they are
+        /// honoured only when the host itself issued that exact tuple for a row that is still current
+        /// (<see cref="_editGrants"/>, afbc68c7). They used to be forwarded as sent, so anything that could
+        /// put a message on the bridge could write any address under any type it named. The tid is part of
+        /// the tuple: it is also passed on so the engine can refuse a write whose thread is no longer the
+        /// selected one; absent when the page has no thread selection to name.
+        /// </para>
+        /// <para>
+        /// A refusal is ANSWERED with a failed varset, the same shape the engine's own refusal takes, so the
+        /// page treats it as the failure it is - and so does a false from SetVariable, which means the
+        /// request never reached the engine and no varset would ever have come.
+        /// </para></summary>
         private void EditVar(string data)
         {
-            if (string.IsNullOrEmpty(data) || _svc.State != DebugSessionState.Paused) return;
-            string va = JsonVal(data, "va");
-            string typeCode = JsonVal(data, "typeCode");
-            int size; int.TryParse(JsonVal(data, "size") ?? "", out size);
-            int places; int.TryParse(JsonVal(data, "places") ?? "0", out places);
-            // The thread the address was read on. The page puts it AHEAD of "value" for JsonVal's benefit
-            // (it takes the first "key": in the text, and value is user-typed). Passed on so the engine can
-            // refuse a write whose thread is no longer the selected one rather than writing another
-            // thread's memory; absent when the page has no thread selection to name.
-            uint tid; bool haveTid = uint.TryParse(JsonVal(data, "tid") ?? "", out tid);
-            string value = JsonVal(data, "value") ?? string.Empty;
-            _svc.SetVariable(va, typeCode, size, places, value, haveTid ? (uint?)tid : null);
+            if (_svc.State != DebugSessionState.Paused) return;
+            var req = EditVarRequest.Parse(data);
+            if (req == null) return;
+            // The grant is SPENT by the write it authorises, so the same request cannot be replayed; the
+            // engine's varset reply re-issues it (OnSvcVariableSet). A write that never left re-issues it now,
+            // because no reply is coming.
+            string why = null;
+            if (_editGrants.IsWritePending(req.Va))
+                why = "a write to this address is still pending — wait for its result, then edit again";
+            else if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
+                why = "that value is no longer current (or was never offered for editing) — let it refresh, then edit again";
+            else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
+            {
+                _editGrants.Regrant(req.Va);
+                why = "the engine did not take the request";
+            }
+            if (why != null) PostVarSet(req.Va, false, null, why);
+        }
+
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
+        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
+        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// address the page named - edit metadata included - and a forged expand would mint the edit grants
+        /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
+        /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
+        private void Expand(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var x = ExpandRequest.Parse(data);
+            if (x == null) return;
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        /// <summary>A call-stack frame's locals: data is <c>reqId|va|ebp</c>, and it is forwarded ONLY when that
+        /// exact (va, ebp) is a frame the host's own stack reply offered since the last stop, resume or thread
+        /// switch (49538b78 wave 5, codex adversary). The engine renders the locals of the procedure at va at
+        /// EBP + each local's offset, edit metadata included, so a real va with a made-up EBP would mint edit
+        /// grants at addresses the page chose - and the page is trusted to READ memory, never to write it.
+        /// <para>
+        /// A frame that was not offered is REFUSED, not forwarded for display only. The page asks only about
+        /// frames it was shown, so a refusal costs a genuine page nothing but a lost race with the next stack
+        /// reply, which re-offers the frames that are current; a display-only forward would keep a second,
+        /// unverified path to the engine that no user needs. Like an expand refusal it is ANSWERED with an
+        /// empty reply for that reqId, so the frame the page is opening does not wait forever - and so is a
+        /// request the service would not send.
+        /// </para></summary>
+        private void FrameLocals(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var fl = FrameLocalsRequest.Parse(data);
+            if (fl == null) return;
+            if (!_editGrants.IsFrameOffered(fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "that frame is no longer current (or was never offered) — let the call stack refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.FrameLocalsForwarded(fl.ReqId);
+        }
+
+        // No tid: this answer is not from any thread, and an unstamped reply is one the page accepts whatever
+        // thread it is showing.
+        private void RefuseFrameLocals(int reqId, string why)
+        {
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "frame locals refused: " + why);
+        }
+
+        private void RefuseExpand(int reqId, string why)
+        {
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "expand refused: " + why);
         }
 
         private void SendBps()
@@ -1381,48 +2112,159 @@ namespace ClarionDebugger.Terminal
             foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
             {
                 if (b.Module != null && (_transientBps.Contains(TransientKey(b.Module, b.Line))
-                                      || _transientBps.Contains(TransientKey(b.Module, b.RequestedLine)))) continue;
+                                      || _transientBps.Contains(TransientKey(b.Module, b.DisplayLine)))) continue;
                 list.Add(b);
             }
 
             // The engine's bp list carries no source path; the IDE gutter is the source of truth for
             // the .clw file. Build a (module|line) -> path map from the gutter so each row can carry
             // the exact path for click-to-open, in both running and stopped states.
+            var paths = GutterPathsByModuleLine();
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var b = list[i];
+                // The state comes back from the SAME call that resolved the path, so the page can never be
+                // handed a reason that does not describe the path beside it. ALWAYS emitted - a row with no
+                // pathState would leave the page guessing again, which is the defect this closes.
+                BpPathState pathState;
+                string path = GutterPathFor(paths, b, out pathState);
+                sb.Append("{\"module\":").Append(Str(b.Module))
+                  .Append(",\"line\":").Append(b.Line)
+                  .Append(",\"requested\":").Append(b.DisplayLine)
+                  .Append(",\"path\":").Append(Str(path))
+                  .Append(",\"pathState\":").Append(Str(PathStateName(pathState)))
+                  .Append(",\"condition\":").Append(Str(b.Condition))
+                  .Append(",\"hitMode\":").Append(Str(b.HitMode))
+                  .Append(",\"hitValue\":").Append(b.HitValue)
+                  .Append(",\"trace\":").Append(Str(b.Trace))
+                  .Append(",\"hitCount\":").Append(b.HitCount)
+                  // The image the engine armed this row in (its ownerPath), or null when it has not said: a pending
+                  // or pre-launch row (contract C2, 1be3b82e). With arm-all, one module:line can be one row per
+                  // image, and the page labels such rows by this. LAST, as the contract freezes it.
+                  .Append(",\"image\":").Append(Str(b.OwnerPath)).Append('}');
+            }
+            sb.Append("]}");
+            Post(sb.ToString());
+        }
+
+        /// <summary>The IDE gutter's bookmarks as (module|line) -> the .clw path that claims it, with a
+        /// NULL value meaning "more than one file claims this key, and we cannot tell which".
+        /// <para>
+        /// A module is a bare basename. In a multi-DLL app two DLLs can each hold a <c>clbrws011.clw</c>
+        /// bookmarked at the same line, and this map used to be a plain assignment - so the second
+        /// bookmark silently overwrote the first and a pane row could carry the OTHER file's path.
+        /// Clicking the filename then opened the wrong source with no hint that it had (task e80072f1);
+        /// <c>OpenBp</c> could not catch it either, because both paths exist on disk.
+        /// </para>
+        /// <para>
+        /// Recording the collision instead of resolving it is the honest answer: the engine names the
+        /// breakpoint by basename, so the host genuinely does not know which of the two files it armed.
+        /// A row with no path falls back to the page's <c>jump</c> action and the .red resolution behind
+        /// it - a best effort that is ADMITTEDLY one, rather than a confident wrong file.
+        /// </para></summary>
+        private Dictionary<string, string> GutterPathsByModuleLine()
+        {
             var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 foreach (var g in _gutter.Snapshot())
                 {
                     if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
-                    paths[g.Module + "|" + g.Line] = g.Path;
-                    paths[g.Module + "|" + g.RequestedLine] = g.Path;
+                    ClaimGutterPath(paths, g.Module + "|" + g.Line, g.Path);
+                    ClaimGutterPath(paths, g.Module + "|" + g.DisplayLine, g.Path);
                 }
             }
             catch { }
+            return paths;
+        }
 
-            for (int i = 0; i < list.Count; i++)
+        /// <summary>Record that <paramref name="path"/> claims <paramref name="key"/>. The first claim
+        /// wins; a second claim from a DIFFERENT file poisons the key to null, and no later claim can
+        /// un-poison it. (The same file claiming the same key twice is ordinary - a bookmark whose
+        /// requested and planted lines are equal claims it under both.)</summary>
+        private static void ClaimGutterPath(Dictionary<string, string> paths, string key, string path)
+        {
+            string had;
+            if (!paths.TryGetValue(key, out had)) { paths[key] = path; return; }
+            if (had != null && !string.Equals(had, path, StringComparison.OrdinalIgnoreCase)) paths[key] = null;
+        }
+
+        /// <summary>Why a breakpoint row has the path it has - or has none. Sent to the page as
+        /// <c>pathState</c> on every bplist row.
+        /// <para>
+        /// The page needs the REASON, not just the absence. The host withholding a path for an ambiguous
+        /// row was only half a fix: the page still rendered <c>path:null</c> as an ordinary link and fell
+        /// back to a basename lookup, so the user could still be taken to an arbitrary same-named file
+        /// with nothing on screen saying the host had refused to choose. "No path" and "several paths and
+        /// I will not guess" call for different UI, and only the host can tell them apart.
+        /// </para></summary>
+        /// <remarks>ORDER IS DELIBERATE: the ZERO value is the SAFEST state, not the most trusted one.
+        /// <c>default(BpPathState)</c> is what a field, an array element, an uninitialised struct member or
+        /// anything deserialised gets for free, and for an enum whose failure mode is taking the user to an
+        /// arbitrary same-named file, that free value must not be <c>Ok</c>. Nothing reaches the default
+        /// today - <see cref="GutterPathFor"/>'s out-param is assigned on its first line - so this is a
+        /// fence, not a fix: it means a future caller who forgets gets "I cannot say", which is refusable,
+        /// rather than "trust this path", which is not.
+        /// <para>
+        /// The wire is unaffected: the three tokens come from <see cref="PathStateName"/>, which compares
+        /// by NAME, so the ordering is invisible to the page and the frozen contract is untouched.
+        /// </para></remarks>
+        private enum BpPathState
+        {
+            Unknown,    // no gutter bookmark claims it at all; there is simply nothing to offer
+            Ambiguous,  // several DIFFERENT files claim it; the host refuses to choose, path is null
+            Ok          // exactly one file claims this row; path is that file
+        }
+
+        /// <summary>The wire spelling of a <see cref="BpPathState"/>. One writer, so the three tokens the
+        /// page switches on cannot drift from the three states the host can produce.</summary>
+        private static string PathStateName(BpPathState state)
+        {
+            return state == BpPathState.Ok ? "ok"
+                 : state == BpPathState.Ambiguous ? "ambiguous"
+                 : "unknown";
+        }
+
+        /// <summary>The .clw path to show for one breakpoint row, with the REASON reported from the SAME
+        /// lookup that resolved it.
+        /// <para>
+        /// ONE PASS, TWO ANSWERS, DELIBERATELY. Deriving the state in a second pass over the map would let
+        /// the two disagree - a row could carry a path while being labelled ambiguous, or the reverse -
+        /// and the page would then be acting on a reason that does not describe the path it was given.
+        /// The contract the page relies on is <c>(pathState == "ok") == (path != null)</c>, and it holds
+        /// here BY CONSTRUCTION: every return that yields a path sets Ok, and the only return that yields
+        /// null sets Ambiguous or Unknown.
+        /// </para>
+        /// <para>
+        /// The entry's OWN path wins when it has one (a gutter-built entry knows the file it came from);
+        /// otherwise the planted line is tried before the requested one, and a contested key is SKIPPED
+        /// rather than returned - a row whose planted line is contested may still have an uncontested
+        /// requested line, and the other way round. Contested-anywhere is remembered, so a row that found
+        /// no usable path but DID meet a contested key reports Ambiguous rather than Unknown: the
+        /// difference is exactly "I will not guess" versus "there is nothing here".
+        /// </para></summary>
+        private static string GutterPathFor(Dictionary<string, string> paths, DebugBreakpoint b, out BpPathState state)
+        {
+            state = BpPathState.Unknown;
+            if (!string.IsNullOrEmpty(b.Path)) { state = BpPathState.Ok; return b.Path; }
+            if (b.Module == null) return null;
+
+            bool contested = false;
+            string p;
+            if (paths.TryGetValue(b.Module + "|" + b.Line, out p))
             {
-                if (i > 0) sb.Append(',');
-                var b = list[i];
-                string path = b.Path;
-                if (string.IsNullOrEmpty(path) && b.Module != null)
-                {
-                    string p;
-                    if (paths.TryGetValue(b.Module + "|" + b.Line, out p)
-                        || paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p)) path = p;
-                }
-                sb.Append("{\"module\":").Append(Str(b.Module))
-                  .Append(",\"line\":").Append(b.Line)
-                  .Append(",\"requested\":").Append(b.RequestedLine)
-                  .Append(",\"path\":").Append(Str(path))
-                  .Append(",\"condition\":").Append(Str(b.Condition))
-                  .Append(",\"hitMode\":").Append(Str(b.HitMode))
-                  .Append(",\"hitValue\":").Append(b.HitValue)
-                  .Append(",\"trace\":").Append(Str(b.Trace))
-                  .Append(",\"hitCount\":").Append(b.HitCount).Append('}');
+                if (p != null) { state = BpPathState.Ok; return p; }
+                contested = true;                      // the key exists but two files claim it
             }
-            sb.Append("]}");
-            Post(sb.ToString());
+            if (paths.TryGetValue(b.Module + "|" + b.DisplayLine, out p))
+            {
+                if (p != null) { state = BpPathState.Ok; return p; }
+                contested = true;
+            }
+            state = contested ? BpPathState.Ambiguous : BpPathState.Unknown;
+            return null;
         }
 
         /// <summary>An image (EXE or DLL) mapped into the target. Surface debuggable images to the
@@ -1439,29 +2281,92 @@ namespace ClarionDebugger.Terminal
             if (m.HasDebug) Console("info", "module loaded: " + m.Name + " (symbols)");
         }
 
-        /// <summary>Read ~±12 lines around the current line from the resolved .clw and show them.</summary>
-        private void SendSource(string path, string proc, int line)
+        /// <summary>Read ~±12 lines around the current line from the resolved .clw and show them.
+        /// <para>
+        /// ALWAYS posts a <c>source</c> message, even when there is nothing to read. "This stop has no
+        /// source" is a state the page has to be TOLD about: this used to return silently, so no source
+        /// message followed the pause and the page's <c>$('src')</c>, <c>curFile</c> and <c>curLine</c> kept
+        /// the PREVIOUS stop's file, listing and highlight under the new stop's header (87c66af6 made the
+        /// 'paused' arm always write that header). <c>curFile</c> is load-bearing: the page sends
+        /// run-to-cursor as <c>curFile + ':' + line</c>, so a stale one armed a breakpoint in a file the user
+        /// was no longer stopped in.
+        /// </para>
+        /// <para>
+        /// An empty <c>lines</c> array is that message, and it keeps buildSource the ONE writer of the
+        /// listing — the same shape 87c66af6 gave the location caption. <paramref name="module"/> is what
+        /// <c>file</c> carries when there is no path, so the header still names where the stop is.
+        /// </para></summary>
+        private void SendSource(string module, string path, string proc, int line)
         {
-            try
+            string[] all = null;
+            // Unreadable is the same as absent as far as the page is concerned — either way there is no
+            // listing for this stop, and either way it must be told so.
+            try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) all = File.ReadAllLines(path); }
+            catch { all = null; }
+
+            bool have = all != null && all.Length > 0;
+            int start = have ? Math.Max(1, line - 12) : 0;
+            int end = have ? Math.Min(all.Length, line + 12) : -1;
+            var sb = new StringBuilder("{\"type\":\"source\",\"file\":")
+                .Append(Str(have ? Path.GetFileName(path) : module))
+                .Append(",\"proc\":").Append(Str(proc))
+                .Append(",\"startLine\":").Append(start)
+                .Append(",\"current\":").Append(line)
+                .Append(",\"lines\":[");
+            for (int i = start; i <= end; i++)
             {
-                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
-                string[] all = File.ReadAllLines(path);
-                int start = Math.Max(1, line - 12);
-                int end = Math.Min(all.Length, line + 12);
-                var sb = new StringBuilder("{\"type\":\"source\",\"file\":").Append(Str(Path.GetFileName(path)))
-                    .Append(",\"proc\":").Append(Str(proc))
-                    .Append(",\"startLine\":").Append(start)
-                    .Append(",\"current\":").Append(line)
-                    .Append(",\"lines\":[");
-                for (int i = start; i <= end; i++)
-                {
-                    if (i > start) sb.Append(',');
-                    sb.Append(Str(all[i - 1]));
-                }
-                sb.Append("]}");
-                Post(sb.ToString());
+                if (i > start) sb.Append(',');
+                sb.Append(Str(all[i - 1]));
             }
-            catch { }
+            sb.Append("]}");
+            Post(sb.ToString());
+        }
+
+        // ------------------------------------------------------------------ the source pane follows the selected thread
+        // (0955b29f, Owner decision 2026-09-24). SendSource used to run only at a stop, so after a thread switch
+        // the pane and its header still showed the STOPPED thread's location. The page re-reads the stack on a
+        // switch, and that reply is stamped with the thread it describes, so it is the switch's source.
+
+        private DebugPause _stopSource;   // the stop's own location; null = not paused (cleared on resume)
+        private uint? _stopTid;           // the stopped thread; null = unknown, and then the pane never follows
+        private uint? _sourceTid;         // the thread whose location the source pane shows now
+
+        private void NoteStopSource(DebugPause p)
+        {
+            _stopSource = p;
+            _stopTid = p.Tid;
+            _sourceTid = p.Tid;
+        }
+
+        /// <summary>Re-points the source pane when a stack reply is for a thread other than the one it shows.
+        /// Back on the stopped thread it restores the stop's OWN source (its location may be a line no frame
+        /// carries, e.g. a step inside runtime code). Repeated replies for the thread on screen send nothing,
+        /// and neither does any reply when the stop named no thread: there is then no way to tell a switch from
+        /// the stop's own stack.</summary>
+        private void FollowSelectedThread(List<DebugStackFrame> frames, uint? tid)
+        {
+            if (_stopSource == null || !_stopTid.HasValue || !tid.HasValue || tid == _sourceTid) return;
+            _sourceTid = tid;
+            if (tid == _stopTid) { SendSource(_stopSource.Module, _stopSource.ResolvedPath, _stopSource.Proc, _stopSource.Line); return; }
+            var f = SourceFrameOf(frames);
+            // No frame with a line: still a source message, so the pane stops showing the other thread's code.
+            if (f == null) SendSource(null, null, null, 0);
+            else SendSource(f.Module, f.ResolvedPath, f.Proc, f.Line);
+        }
+
+        /// <summary>The frame whose line is a thread's location: frame 0 when it has a line, else the first frame
+        /// that is a real Clarion frame (a proc, and an ebp other than "0x0") with a line. A thread stopped inside
+        /// the runtime has no line in frame 0; the engine gives frames above a runtime frame a real ebp.</summary>
+        internal static DebugStackFrame SourceFrameOf(List<DebugStackFrame> frames)
+        {
+            if (frames == null) return null;
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (f == null || f.Line <= 0 || string.IsNullOrEmpty(f.Module)) continue;
+                if (i == 0 || (f.Proc != null && f.Ebp != "0x0")) return f;
+            }
+            return null;
         }
 
         // ------------------------------------------------------------------ gutter breakpoints
@@ -1473,7 +2378,7 @@ namespace ClarionDebugger.Terminal
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
                 SendBps();
             }
         }
@@ -1483,14 +2388,49 @@ namespace ClarionDebugger.Terminal
             // Keep _pending in sync regardless of run state — it's what StartSession() resends wholesale
             // on the NEXT session, so a removal that only reached the live engine (running-session branch)
             // would otherwise resurrect the "removed" breakpoint on the next start.
-            _pending.RemoveAll(b => SameBp(b, module, line));
-            if (_svc.IsRunning) _svc.RemoveBreakpoint(module, line);
-            else SendBps();
+            //
+            // THE ORDERING BELOW IS DELIBERATE — do not "tidy" the trim back above the engine call.
+            // While running, _pending is trimmed ONLY if the engine actually took the removal.
+            // RemoveBreakpoint returns false when IsValidModuleName rejects the module or SendCommand
+            // fails, and the breakpoint is then still ARMED in the live session. Trimming anyway would
+            // forget an armed breakpoint: the user gets a stop they cannot account for and has nothing
+            // left to retry from. A stale pending entry is the better failure — it is visible in the
+            // pane and they can remove it again.
+            if (_svc.IsRunning)
+            {
+                if (_svc.RemoveBreakpoint(module, line)) _pending.RemoveAll(b => SameBp(b, module, line));
+            }
+            else
+            {
+                _pending.RemoveAll(b => SameBp(b, module, line));
+                SendBps();
+            }
         }
 
+        /// <summary>Does this staged entry name (module, line)? The line every caller passes is a
+        /// REQUESTED line - the gutter's, the Procedures list's, the pane's <c>b.requested</c> - so this
+        /// keys on the requested line, the same key <see cref="ClarionDebuggerService.SameBpIdentity"/>
+        /// and <see cref="ClarionDebuggerService.BpDelMatches"/> use, by calling the same body they do.
+        /// <para>
+        /// It used to also match <c>b.Line == line</c>, a two-way OR that let ONE removal trim a
+        /// DIFFERENT staged entry whose planted line happened to equal the removed one's requested line -
+        /// silently losing it from the next session's launch spec (b1db9a76 item 2). That OR was
+        /// unreachable in-tree, because every _pending entry is created with Line equal to its requested line and
+        /// nothing writes the engine's snapped line back into _pending. It was held back from wave 1
+        /// until 05959085 settled which line is the key; it has, so the OR is gone rather than left as a
+        /// promise the rest of the identity code no longer makes.
+        /// </para>
+        /// <para>
+        /// The absent case is not dropped with it: BpLineMatches still falls back to the planted line for
+        /// an entry with no requested line at all, which is what an echo from an engine older than that
+        /// protocol change leaves behind. Module is compared ignoring case here and not there because one
+        /// side of THIS comparison is a gutter basename (Path.GetFileName keeps the file's own case)
+        /// while both sides of those are engine-lowercased.
+        /// </para></summary>
         private static bool SameBp(DebugBreakpoint b, string module, int line)
         {
-            return string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && (b.RequestedLine == line || b.Line == line);
+            return string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase)
+                && ClarionDebuggerService.BpLineMatches(b, line, line);
         }
 
         // ------------------------------------------------------------------ helpers
@@ -1521,13 +2461,18 @@ namespace ClarionDebugger.Terminal
         /// the visible Monaco editor never scrolls. Prefer the Monaco navigator (its frozen contract covers
         /// overlay ON and OFF and self-queues if the page isn't ready); only fall back to the stock editor's
         /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.
-        /// Returns true when it took that native path (so the native marker is now painted).</summary>
-        private static bool TryJump(string path, int line)
+        ///
+        /// RETURN VALUE IS <c>usedNativeMarker</c>, NOT SUCCESS. True means the jump went through the stock
+        /// editor, which also paints the native current-line marker, so the caller knows a native marker is
+        /// now on screen and may need clearing. This used to be named as a Try* method, which read like a
+        /// success flag and inverted the usual meaning of that prefix: it returns true precisely on the
+        /// FALLBACK path, and false when the preferred Monaco navigator handled the jump.</summary>
+        private static bool JumpToLine(string path, int line)
         {
             if (string.IsNullOrEmpty(path)) return false;
             try
             {
-                var nav = ResolveMonacoNavigator();
+                var nav = _hookNavigate.Method;
                 if (nav != null)
                 {
                     object handled = nav.Invoke(null, new object[] { path, line, 1 });
@@ -1535,41 +2480,17 @@ namespace ClarionDebugger.Terminal
                 }
             }
             catch { }
-            try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
-            catch { }
+            PaintNativeMarker(path, line);
             return true;
         }
 
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine.
-        private static MethodInfo _monacoExecLine;
-
-        /// <summary>Resolve ClarionAssistant's execution-line marker hook, if that addin is loaded and new
-        /// enough to have it. Same reflection pattern as <see cref="ResolveMonacoNavigator"/>.
-        /// Frozen contract (issue #26, with ClarionAssistant ticket #26a):
-        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine(string filePath, int line)
-        ///   set: path + line &gt;= 1 paints one global marker, with no navigation or focus change. Returns
-        ///   true when Monaco painted it, false when the overlay is OFF (caller paints the native marker).
-        ///   clear: null/empty path or line &lt;= 0. Always returns true; idempotent.
-        /// Null == method missing (ClarionAssistant absent or an older build) → callers keep the pre-#26
-        /// behaviour exactly and make no new calls.</summary>
-        private static MethodInfo ResolveMonacoExecutionLine()
+        /// <summary>Paint the stock editor's current-execution-line marker (the yellow bar) at
+        /// <paramref name="path"/>:<paramref name="line"/>, which is a side effect of its current-line jump.
+        /// A throw is swallowed: failing to paint a marker must never break stepping.</summary>
+        private static void PaintNativeMarker(string path, int line)
         {
-            if (_monacoExecLine != null) return _monacoExecLine;
-            try
-            {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("SetExecutionLine", BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(string), typeof(int) }, null);
-                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoExecLine = mi; break; }
-                }
-            }
+            try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
             catch { }
-            return _monacoExecLine;
         }
 
         /// <summary>Call SetExecutionLine; a throw counts as "not painted" so stepping never breaks.</summary>
@@ -1587,7 +2508,7 @@ namespace ClarionDebugger.Terminal
         /// stock editor's native arrow. Without the hook this is exactly <see cref="ClearCurrentLineMarker"/>.</summary>
         private static void ClearExecutionLine()
         {
-            var setter = ResolveMonacoExecutionLine();
+            var setter = _hookExecLine.Method;
             if (setter != null) InvokeExecutionLine(setter, null, 0);
             ClearCurrentLineMarker();
         }
@@ -1596,44 +2517,210 @@ namespace ClarionDebugger.Terminal
         /// SetExecutionLine hook is bound; without it no clear happened here before #26, so none happens now.</summary>
         private static void ClearExecutionLineIfHooked()
         {
-            if (ResolveMonacoExecutionLine() != null) ClearExecutionLine();
+            if (_hookExecLine.Method != null) ClearExecutionLine();
         }
 
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine.
-        private static MethodInfo _monacoNav;
+        // ─────────────────────────────────────────── cross-addin reflection: ONE resolver for every hook
+        //
+        // Every hook into ClarionAssistant lives on ONE type, and there is no compile-time reference between
+        // the two addins, so they all bind by name at runtime. Three near-identical AppDomain scans used to
+        // do that; this is the single copy of it.
+        //
+        // Reflection across an addin boundary fails SILENTLY by nature: rename a method or change a parameter
+        // on the other side and the feature simply stops existing, with nothing anywhere saying so. The whole
+        // shape of what follows is about making that failure legible — bind by FULL signature, tell "not
+        // loaded" apart from "older build" and from "wrong shape", and notice a second loaded copy.
 
-        /// <summary>Resolve ClarionAssistant's Monaco-aware navigation entry point, if that addin is loaded.
-        /// The Clarion source editor is replaced by ClarionAssistant's Monaco overlay; positioning an
-        /// already-open Monaco editor has no public API, so ClarionAssistant exposes this hook for us.
-        /// We have no compile-time reference to that addin, so we bind by name via reflection and cache it.
-        /// Frozen contract (with CA-Terminal-1-CC):
-        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine(string filePath, int line, int column)
-        ///   line/column 1-based; returns true when it handled the request (covers Monaco overlay ON and OFF,
-        ///   and self-queues if the editor isn't ready yet); false only when it could not (bad/missing path).
-        /// Absent type == ClarionAssistant not loaded (dev not using Monaco) → caller uses the native path.</summary>
-        private static MethodInfo ResolveMonacoNavigator()
+        private const string MonacoTypeName = "ClarionAssistant.Services.MonacoSourceNavigator";
+
+        /// <summary>The assembly the hook type must come from. Verified against the shipped
+        /// ClarionAssistant.dll, whose simple name is exactly this; it is unsigned, so the name is the only
+        /// identity available. This is NOT an attack boundary — any in-process IDE addin is already fully
+        /// trusted. It stops us binding to an unrelated assembly that happens to define the same type name,
+        /// and it is what makes a STALE second copy reportable instead of silently chosen.</summary>
+        private const string MonacoAssemblyName = "ClarionAssistant";
+
+        /// <summary>Why a hook is not callable. Three different problems with three different fixes, and
+        /// collapsing them all into "null" is what made this integration undiagnosable:
+        /// <list type="bullet">
+        /// <item>NotLoaded — ClarionAssistant isn't installed or enabled. Normal; the user fixes it.</item>
+        /// <item>OlderBuild — it IS loaded but predates this hook. The user upgrades it.</item>
+        /// <item>WrongShape — the method is there under a DIFFERENT signature, i.e. the two addins have
+        /// drifted apart. A developer fixes it, and nothing else in either process would ever say so.</item>
+        /// </list></summary>
+        private enum HookStatus { Unresolved, Bound, NotLoaded, OlderBuild, WrongShape }
+
+        /// <summary>One late-bound static method on MonacoSourceNavigator, bound by FULL signature and cached
+        /// for the session — INCLUDING the misses. Before this, an unresolved hook re-scanned every loaded
+        /// assembly on every call, so a single step ran three whole-AppDomain scans whenever ClarionAssistant
+        /// was absent or older. <see cref="Rearm"/> drops the cache at session start, the one moment where the
+        /// set of loaded addins can usefully have changed and re-paying for the scan is worth it.</summary>
+        private sealed class MonacoHook
         {
-            if (_monacoNav != null) return _monacoNav;
-            try
+            private readonly string _name;
+            private readonly Type _returns;
+            private readonly Type[] _takes;
+            private MethodInfo _mi;
+            private HookStatus _status;
+
+            public MonacoHook(string name, Type returns, params Type[] takes)
             {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                _name = name; _returns = returns; _takes = takes;
+            }
+
+            /// <summary>The bound method, or null when it did not resolve. Resolves on first use.</summary>
+            public MethodInfo Method { get { Resolve(); return _mi; } }
+
+            public HookStatus Status { get { Resolve(); return _status; } }
+
+            /// <summary>Forget the cached resolution, misses included, so the next use re-scans.</summary>
+            public void Rearm() { _mi = null; _status = HookStatus.Unresolved; }
+
+            /// <summary>One clause naming what is wrong and what fixes it, for the Debug Console. Null once
+            /// the hook is bound.</summary>
+            public string Explain()
+            {
+                switch (Status)
                 {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("NavigateToFileAndLine", BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(string), typeof(int), typeof(int) }, null);
-                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoNav = mi; break; }
+                    case HookStatus.NotLoaded:
+                        return "ClarionAssistant isn't loaded";
+                    case HookStatus.OlderBuild:
+                        return "this build of ClarionAssistant has no " + _name + " — upgrade it";
+                    case HookStatus.WrongShape:
+                        return "ClarionAssistant's " + _name + " has a different signature than this debugger "
+                             + "expects — the two addins have drifted apart, so upgrade both to matching builds";
+                    default:
+                        return null;
                 }
             }
-            catch { }
-            return _monacoNav;
+
+            private void Resolve()
+            {
+                if (_status != HookStatus.Unresolved) return;
+                // Pessimistic default: anything throwing below settles as NotLoaded and STAYS cached, so a
+                // failing scan can never degrade into a scan on every call.
+                _status = HookStatus.NotLoaded;
+                try
+                {
+                    var t = FindMonacoType();
+                    if (t == null) return;
+                    // Bind by full signature, not by name. A name-only bind accepts a method whose parameters
+                    // have drifted and then throws at Invoke time, where it reads as "the feature didn't work"
+                    // rather than "the two addins disagree" — and for an out-parameter hook read through an
+                    // object[] it may not even throw, just write back plausible-looking garbage.
+                    var exact = t.GetMethod(_name, BindingFlags.Public | BindingFlags.Static, null, _takes, null);
+                    if (exact != null && exact.ReturnType == _returns)
+                    {
+                        _mi = exact; _status = HookStatus.Bound; return;
+                    }
+                    // The type resolved, so ClarionAssistant IS loaded. Absent by name means an older build;
+                    // present under another shape (or as overloads, none of which fit) means version skew.
+                    bool byNameExists;
+                    try { byNameExists = t.GetMethod(_name, BindingFlags.Public | BindingFlags.Static) != null; }
+                    catch (AmbiguousMatchException) { byNameExists = true; }
+                    _status = byNameExists ? HookStatus.WrongShape : HookStatus.OlderBuild;
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>Frozen contract (with CA-Terminal-1-CC):
+        ///   bool NavigateToFileAndLine(string filePath, int line, int column)
+        ///   line/column 1-based; true when it handled the request (covers the Monaco overlay ON and OFF, and
+        ///   self-queues if the editor isn't ready yet); false only when it could not (bad/missing path).
+        /// The Clarion source editor is replaced by ClarionAssistant's Monaco overlay and positioning an
+        /// already-open Monaco editor has no public API, which is why that addin exposes this for us.</summary>
+        private static readonly MonacoHook _hookNavigate =
+            new MonacoHook("NavigateToFileAndLine", typeof(bool), typeof(string), typeof(int), typeof(int));
+
+        /// <summary>Frozen contract (issue #26, with ClarionAssistant ticket #26a):
+        ///   bool SetExecutionLine(string filePath, int line)
+        ///   set: path + line &gt;= 1 paints one global marker, with no navigation or focus change. Returns
+        ///   true when Monaco painted it, false when the overlay is OFF (caller paints the native marker).
+        ///   clear: null/empty path or line &lt;= 0. Always returns true; idempotent.
+        /// Unbound → callers keep the pre-#26 behaviour exactly and make no new calls.</summary>
+        private static readonly MonacoHook _hookExecLine =
+            new MonacoHook("SetExecutionLine", typeof(bool), typeof(string), typeof(int));
+
+        /// <summary>Frozen contract:
+        ///   bool TryGetActiveCursor(out string filePath, out int line, out int column)
+        /// This one is read through Invoke with an object[] whose slots are written back, so a drifted
+        /// parameter list would come back as plausible-looking values rather than a throw — which is why the
+        /// by-ref types are spelled out here and the bind is exact.</summary>
+        private static readonly MonacoHook _hookCursor =
+            new MonacoHook("TryGetActiveCursor", typeof(bool),
+                typeof(string).MakeByRefType(), typeof(int).MakeByRefType(), typeof(int).MakeByRefType());
+
+        /// <summary>Set when more than one loaded assembly answers to <see cref="MonacoAssemblyName"/>;
+        /// cleared by <see cref="RearmMonacoHooks"/>. Reported once per session rather than per scan.</summary>
+        private static string _monacoDupeNote;
+
+        /// <summary>The single AppDomain scan behind every hook. Requires the defining assembly to be named
+        /// <see cref="MonacoAssemblyName"/>, and records when MORE THAN ONE loaded assembly answers to it:
+        /// two ClarionAssistant builds in one process is the stale-copy case, where every hook binds to
+        /// whichever loaded first and the user watches a feature behave like a version they are not running.
+        /// Silently taking the first match is exactly how that stays invisible.</summary>
+        private static Type FindMonacoType()
+        {
+            Type first = null;
+            var copies = new List<string>();
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                string simple;
+                try { simple = asm.GetName().Name; }
+                catch { continue; }
+                if (!string.Equals(simple, MonacoAssemblyName, StringComparison.OrdinalIgnoreCase)) continue;
+                Type t;
+                try { t = asm.GetType(MonacoTypeName, false); }
+                catch { t = null; }
+                if (t == null) continue;
+                if (first == null) first = t;
+                // Version and location are gathered independently: Location throws for some assemblies, and
+                // losing the VERSION is what would make this note useless — telling the two copies apart is
+                // the entire point of it.
+                string ver, loc;
+                try { ver = asm.GetName().Version.ToString(); } catch { ver = "<unknown version>"; }
+                try { loc = asm.Location; } catch { loc = null; }
+                copies.Add(ver + " @ " + (string.IsNullOrEmpty(loc) ? "<no file>" : loc));
+            }
+            if (copies.Count > 1)
+            {
+                _monacoDupeNote = copies.Count + " loaded copies of " + MonacoAssemblyName
+                    + "; hooks bind to the first — " + string.Join(" | ", copies.ToArray());
+            }
+            return first;
+        }
+
+        /// <summary>Drop every cached resolution, misses included, so the next use re-scans. Called at session
+        /// start: ClarionAssistant may have been enabled, or a newer build loaded, since the last miss was
+        /// cached, and that miss would otherwise stand for the life of the IDE process.</summary>
+        private static void RearmMonacoHooks()
+        {
+            _hookNavigate.Rearm(); _hookExecLine.Rearm(); _hookCursor.Rearm();
+            _monacoDupeNote = null;
+        }
+
+        /// <summary>Re-scan at session start and say, once, what is actually wrong with the cross-addin hooks.
+        /// Only the two conditions a user cannot otherwise discover are reported: a signature that has drifted
+        /// (nothing else in either process would ever mention it, because every caller reads an unbound hook
+        /// as "ClarionAssistant isn't here" and quietly takes the native path), and a second loaded copy.
+        /// NotLoaded is deliberately silent — it is the normal state for anyone not using Monaco, and a
+        /// console line about it every session would be noise.</summary>
+        private void RearmAndReportMonacoHooks()
+        {
+            RearmMonacoHooks();
+            var hooks = new[] { _hookNavigate, _hookExecLine, _hookCursor };
+            foreach (var h in hooks)
+            {
+                if (h.Status == HookStatus.WrongShape) Console("err", "Monaco hook: " + h.Explain());
+            }
+            // After the hooks have resolved, so the scan has had a chance to spot a second copy.
+            if (_monacoDupeNote != null) Console("warn", "Monaco hooks: " + _monacoDupeNote);
         }
 
         /// <summary>Open a source file in the Clarion editor and place the caret on <paramref name="line"/>
         /// (1-based). Used for click-to-navigate from the pane (breakpoint list, call-stack frame). Unlike
-        /// the pause-time <see cref="TryJump"/>, this does NOT paint the yellow current-execution-line marker
+        /// the pause-time <see cref="JumpToLine"/>, this does NOT paint the yellow current-execution-line marker
         /// — clicking a breakpoint isn't an execution stop.
         ///
         /// Prefer ClarionAssistant's Monaco navigator when present: with the Monaco overlay on, our native
@@ -1654,7 +2741,7 @@ namespace ClarionDebugger.Terminal
             // (native caret) branch and self-queues if the page isn't ready. 1-based line + column.
             try
             {
-                var nav = ResolveMonacoNavigator();
+                var nav = _hookNavigate.Method;
                 if (nav != null)
                 {
                     object handled = nav.Invoke(null, new object[] { path, line, 1 });
@@ -1689,7 +2776,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>
-        /// After TryJump moves the Clarion editor to the current line (which steals keyboard focus),
+        /// After JumpToLine moves the Clarion editor to the current line (which steals keyboard focus),
         /// bring the debugger pad back to front and refocus the WebView so the next configured
         /// shortcut is delivered to the debugger page rather than the Clarion editor. Posted via
         /// BeginInvoke so it runs after the editor's activation has settled.
@@ -1877,43 +2964,6 @@ namespace ClarionDebugger.Terminal
             return sb.ToString();
         }
 
-        // minimal extractor for the flat {action,data} messages from the page
-        /// <summary>Read one field out of a message from the page.
-        /// <para>
-        /// RULE FOR EVERY PAYLOAD THIS READS: a field whose content is user-typed or comes from the
-        /// debuggee goes LAST. This takes the FIRST <c>"key":</c> it finds anywhere in the text, so a
-        /// string value containing <c>"tid":123</c> or <c>"line":9</c> is read as that field when it sits
-        /// ahead of the real one. The page's own senders say the same thing where they build their
-        /// payloads — breakonprocentry puts module+line ahead of the procedure name, editvar puts tid
-        /// ahead of the value the user typed — and any new payload must do the same.
-        /// </para></summary>
-        private static string JsonVal(string json, string key)
-        {
-            string search = "\"" + key + "\":";
-            int i = json.IndexOf(search, StringComparison.Ordinal);
-            if (i < 0) return null;
-            i += search.Length;
-            while (i < json.Length && json[i] == ' ') i++;
-            if (i >= json.Length) return null;
-            if (json[i] == 'n') return null; // null
-            if (json[i] == '"')
-            {
-                i++;
-                var sb = new StringBuilder();
-                while (i < json.Length)
-                {
-                    char c = json[i];
-                    if (c == '\\' && i + 1 < json.Length) { char n = json[i + 1]; sb.Append(n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : n); i += 2; continue; }
-                    if (c == '"') break;
-                    sb.Append(c); i++;
-                }
-                return sb.ToString();
-            }
-            int s = i;
-            while (i < json.Length && json[i] != ',' && json[i] != '}') i++;
-            return json.Substring(s, i - s).Trim();
-        }
-
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -1946,16 +2996,25 @@ namespace ClarionDebugger.Terminal
                 if (wasLive)
                 {
                     // A session was live. _svc.Stop() blocks (WaitForExit(1500) + Kill) and runs off the UI
-                    // thread. Do NOT Unregister now — that would let the controller report Idle and re-enable
+                    // thread. For an ATTACHED session Stop() DETACHES rather than quitting, so closing the pad never
+                    // kills an app the user attached to (3f2d747f); and if the IDE exits before this task finishes,
+                    // the engine sees its stdin close and detaches on its own (the engine contract). Do NOT Unregister now — that would let the controller report Idle and re-enable
                     // the toolbar Start while the old engine/target is still dying (close→reopen→re-run-same-exe
                     // would race a still-terminating process / file lock). Keep the controller's current
                     // non-idle state; only AFTER Stop() completes do we signal the controller (NotifyStopped),
                     // which returns to Idle iff the then-current target is genuinely idle, then Unregister this
                     // instance. Order matters: NotifyStopped before Unregister so a no-reopen close still drops
                     // to Idle (NotifyStopped sees _target==this whose session is now idle).
+                    //
+                    // THE PAD'S HANDLERS ARE GONE BY NOW (DetachServiceEvents above), and so is its page. TeardownLive
+                    // keeps its OWN observer on the service until Stop has returned, so a detach that reports an error,
+                    // or an attached engine Stop had to kill, still reaches the user - through the log and a dialog on
+                    // this (UI) thread's context, captured here because the task below runs elsewhere (3f2d747f run 2).
+                    var warn = DurableWarning.ForCurrentThread();
+                    string attachedName = _lastAttachName;
                     System.Threading.Tasks.Task.Run(() =>
                     {
-                        try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dispose stop: " + ex.Message); }
+                        try { TeardownLive(svc, attachedName, warn); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dispose stop: " + ex.Message); }
                         try { DebugSessionController.NotifyStopped(this); } catch { }
                         try { DebugSessionController.Unregister(this); } catch { }
                     });
@@ -1971,6 +3030,143 @@ namespace ClarionDebugger.Terminal
                 if (_webView != null) { try { _webView.Dispose(); } catch { } _webView = null; }
             }
             base.Dispose(disposing);
+        }
+
+        /// <summary>End a live session from a pad that is going away (3f2d747f, pipeline run 2). The pad's own handlers
+        /// are already unsubscribed, and its page with them, so the risky outcomes of a teardown - a detach that
+        /// reports an error, or an attached engine that had to be killed (bytes left planted: the app will probably
+        /// crash) - would reach no one. A <see cref="TeardownObserver"/> is subscribed FIRST and stays subscribed until
+        /// Stop has returned, and Stop raises both outcomes before it returns; <paramref name="warn"/> is the durable
+        /// channel that does not need the page. A clean detach, or a launch, warns about nothing.</summary>
+        internal static bool TeardownLive(ClarionDebuggerService svc, string attachedName, Action<string> warn)
+        {
+            using (new TeardownObserver(svc, attachedName, warn))
+            {
+                return svc.Stop();
+            }
+        }
+    }
+
+    /// <summary>Watches ONE teardown for an unsafe detach and reports it through <c>warn</c> (see
+    /// <see cref="ClarionDebuggerWebView.TeardownLive"/>). Subscribes in its constructor, unsubscribes in Dispose.</summary>
+    internal sealed class TeardownObserver : IDisposable
+    {
+        private readonly ClarionDebuggerService _svc;
+        private readonly string _name;
+        private readonly Action<string> _warn;
+
+        public TeardownObserver(ClarionDebuggerService svc, string attachedName, Action<string> warn)
+        {
+            _svc = svc; _name = attachedName; _warn = warn;
+            _svc.Detached += OnDetached;
+            _svc.DetachAbandoned += OnAbandoned;
+        }
+
+        private void OnDetached(DebugDetach d)
+        {
+            // The warning is driven by the engine's `error` alone, exactly as on a live page (OnSvcDetached).
+            if (d == null || string.IsNullOrEmpty(d.Error)) return;
+            _warn(ClarionDebuggerWebView.DetachWarningText(string.IsNullOrEmpty(d.Name) ? _name : d.Name, d.Pid, d.Error));
+        }
+
+        private void OnAbandoned(AttachableProcess t)
+        {
+            _warn(ClarionDebuggerWebView.DetachWarningText(t != null && !string.IsNullOrEmpty(t.Name) ? t.Name : _name,
+                t != null ? (uint?)t.Pid : null,
+                "the engine did not detach in time and had to be killed, so breakpoints may still be planted"));
+        }
+
+        public void Dispose()
+        {
+            _svc.Detached -= OnDetached;
+            _svc.DetachAbandoned -= OnAbandoned;
+        }
+    }
+
+    /// <summary>A warning that must be SEEN although the pad that would have shown it is gone: a dated line in
+    /// %LOCALAPPDATA%\CA Debugger\detach.log (the add-in has no other log), then a dialog posted to the IDE's UI
+    /// thread. Posted, not sent, so it never blocks the teardown that raised it; with no UI context (the IDE is
+    /// already past its message loop) it gets its own STA thread. Either half failing leaves the other.</summary>
+    internal static class DurableWarning
+    {
+        public static string LogPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CA Debugger", "detach.log"); }
+        }
+
+        /// <summary>Make a warner bound to the UI context of the CALLER (call it on the UI thread).</summary>
+        public static Action<string> ForCurrentThread()
+        {
+            var ui = System.Threading.SynchronizationContext.Current;
+            return text => Show(text, ui);
+        }
+
+        /// <summary>Where the log goes when <see cref="LogPath"/> cannot be written (%TEMP%\CA Debugger\detach.log).</summary>
+        public static string FallbackLogPath
+        {
+            get { return Path.Combine(Path.GetTempPath(), "CA Debugger", "detach.log"); }
+        }
+
+        /// <summary>Which channels a warning actually went out on.</summary>
+        [Flags]
+        internal enum Channels { None = 0, Log = 1, FallbackLog = 2, PostedDialog = 4, ThreadDialog = 8 }
+
+        public static Channels Show(string text, System.Threading.SynchronizationContext ui)
+        {
+            return Deliver(text, new[] { LogPath, FallbackLogPath }, ui, StartStaThread, ShowBox);
+        }
+
+        /// <summary>Log to the first of <paramref name="logPaths"/> that can be written, then show the dialog: posted
+        /// to <paramref name="ui"/> when there is one, and on its own STA thread when there is none OR the post THROWS
+        /// (a destroyed handle during IDE shutdown). The dialog does not depend on either log succeeding.</summary>
+        internal static Channels Deliver(string text, IList<string> logPaths, System.Threading.SynchronizationContext ui,
+                                         Action<Action> startStaThread, Action<string> showBox)
+        {
+            var sent = Channels.None;
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text + Environment.NewLine;
+            for (int i = 0; i < logPaths.Count; i++)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPaths[i]));
+                    File.AppendAllText(logPaths[i], line);
+                    sent |= i == 0 ? Channels.Log : Channels.FallbackLog;
+                    break;
+                }
+                catch { }   // try the next location; the dialog below goes out whatever happens here
+            }
+            if (ui != null)
+            {
+                try
+                {
+                    ui.Post(_ => showBox(text), null);
+                    return sent | Channels.PostedDialog;
+                }
+                catch (Exception)
+                {
+                    // The UI context is going (its handle destroyed during IDE shutdown). Not swallowed: the dialog
+                    // falls through to its own thread below.
+                }
+            }
+            try
+            {
+                startStaThread(() => showBox(text));
+                sent |= Channels.ThreadDialog;
+            }
+            catch { }
+            return sent;
+        }
+
+        private static void ShowBox(string text)
+        {
+            try { MessageBox.Show(text, "CA Debugger", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
+        }
+
+        private static void StartStaThread(Action body)
+        {
+            var t = new System.Threading.Thread(() => body()) { IsBackground = false };
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
         }
     }
 }

@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<!-- Content-Security-Policy (1797b13a). The page's one inline script block runs because script-src names the
+     sha256 of its exact text, so ANY edit to that script must re-hash it here: tools/test-pad-csp.js fails
+     until it does and prints the hash to paste. There are no inline on*= handlers (CSP blocks them): wire
+     events from the script. Styles stay 'unsafe-inline' for the style= attributes and runtime styles. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-/wIn/pX2AIEIwVq6v/A1X65FqOh54npQJM29QDNdxt8='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
 <title>CA Debugger</title>
 <style>
   :root {
@@ -51,14 +56,15 @@
      mirroring how the mini source view's own right-click item greys itself out. */
   #btnRtc { opacity:.4; pointer-events:none; }
   body.paused #btnRtc { opacity:1; pointer-events:auto; }
+  /* Attach… only means anything with no session running (3f2d747f): gated on body.idle, set by setRunState. */
+  #btnAttach { opacity:.4; pointer-events:none; }
+  body.idle #btnAttach { opacity:1; pointer-events:auto; }
   .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
   .dot { width:8px; height:8px; border-radius:50%; background:#888; }
   .runstate.paused .dot { background:var(--warn); box-shadow:0 0 6px var(--warn-border); }
   .runstate.running .dot { background:#4ec9b0; box-shadow:0 0 6px #4ec9b088; }
   .runstate.idle .dot { background:#888; }
 
-  .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
-  .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
 
   /* Target bar — the resolved EXE, always on screen. This used to be announced only in the Debug
      Console, which is a hideable section, so with it collapsed there was no way to see what was
@@ -71,6 +77,13 @@
   .exebar .path:hover { color:var(--accent-hi); text-decoration:underline; }
   .exebar .path.none { color:var(--fg-dim); cursor:default; text-decoration:none; font-style:italic; }
   .exebar .path.missing { color:var(--red); }
+  /* A path the host kept to retry but could NOT confirm for the current solution (0214f33a). It must not
+     read as the answer: dimmed and italic like "no target", with the caution mark and the host's note in
+     --warn so the reason is the legible part. */
+  .exebar .path.unconfirmed { color:var(--fg-dim); font-style:italic; }
+  .exebar .path.unconfirmed:hover { color:var(--fg-dim); }
+  .exebar .tmark { color:var(--warn); font-style:normal; margin-right:5px; }
+  .exebar .tnote { color:var(--warn); font-style:normal; margin-left:8px; }
 
   .main { flex:1; display:flex; min-height:0; }
   .sidebar { width:360px; min-width:180px; background:var(--panel); display:flex; flex-direction:column; overflow-y:auto; flex:none; }
@@ -169,6 +182,7 @@
   .vas.active { opacity:.85; color:var(--green); }
   .vas:hover { opacity:1; color:var(--fg); }
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
+  .vframe { color:var(--fg-dim); font-size:10px; margin-right:6px; border:1px solid var(--popup-border); border-radius:3px; padding:0 4px; white-space:nowrap; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
   .row:hover .pin { opacity:1; } .pin:hover { color:var(--warn); } .pin.pinned { opacity:1; color:var(--warn); }
@@ -215,6 +229,16 @@
   .thsel .thsel-ar { color:var(--fg-dim); font-size:9px; }
   /* viewing a thread other than the one the engine stopped on — amber everywhere it shows */
   .thsel.other { border-color:var(--warn); color:var(--warn); background:var(--warn-bg); }
+  /* identify-thread-by-window toggle (f6e547ce): off is a bare glyph; on shows which thread owns the window
+     under the mouse, and while PAUSED hovering selects that thread */
+  .thhover { margin-left:4px; display:inline-flex; align-items:center; gap:4px; flex:0 1 auto; min-width:0; max-width:170px;
+             padding:1px 6px; border:1px solid var(--popup-border); border-radius:10px; background:var(--input); color:var(--fg-dim);
+             font-size:10px; font-weight:600; letter-spacing:0; text-transform:none; cursor:pointer; }
+  .thhover:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover.on { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover .thhover-ic { flex:none; }
+  .thhover .thhover-t { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thhover .thhover-t:empty { display:none; }
   .thpick { display:none; margin:2px 8px 4px; border:1px solid var(--popup-border); border-radius:4px; background:var(--popup); overflow:hidden; }
   .thpick.show { display:block; }
   .thpick .thhdr { padding:4px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
@@ -252,12 +276,22 @@
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
   .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
   .bp .bplink:hover { filter:brightness(1.25); }
+  /* An AMBIGUOUS row must not look clickable: several files claim this module:line and the host refuses to
+     choose, so there is no correct target to offer. Not blue, not underlined, not a pointer - `cursor:help`
+     because the affordance it DOES have is the explanation. */
+  .bp .bplink.ambig { color:var(--fg-dim); cursor:help; text-decoration:underline dotted; }
+  .bp .bplink.ambig:hover { filter:none; }
+  .bp .badge.ambig { color:var(--warn); }
   /* owning procedure (+ routine crumb) — subordinate to module:line. The outsized flex-shrink is what
      makes it yield room before module:line does: flex distributes shrink in proportion to each item's
      base size, so a plain "0 1 auto" would shorten the location alongside it. min-width:0 is what lets a
      flex child shrink below its content at all, and is required for the ellipsis to appear. */
   .bp .bpproc { color:var(--yellow); font-size:11px; opacity:.85; flex:0 999 auto; min-width:0;
                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:help; }
+  /* which image a row belongs to - shown only when two or more rows share module:line (1be3b82e) */
+  .bp .bpimg { color:var(--fg-dim); font-size:11px; border:1px solid var(--border); border-radius:3px;
+               padding:0 4px; flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; cursor:help; }
 
   .procfilter { padding:5px 10px 5px 14px; }
   .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
@@ -270,6 +304,14 @@
   .listctl input::placeholder { color:#6f6f6f; }
   .sortbtn { flex:none; cursor:pointer; background:var(--btnhover,#2d2d2d); border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:3px; padding:3px 8px; font-size:11px; white-space:nowrap; }
   .sortbtn:hover { color:var(--fg); }
+  /* Memory panel: a 16-byte hex + ASCII dump. Dimmed while running - the bytes are from the last stop. */
+  .memctl select { flex:none; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; font-size:11px; }
+  .memctl input.bad { border-color:#c98a8a; }
+  #memBody { font-size:11px; padding:2px 10px 4px 14px; overflow-x:auto; }
+  #memBody .mrow { display:flex; gap:10px; white-space:pre; }
+  #memBody .madr { color:var(--fg-dim); } #memBody .mhex { color:var(--num); } #memBody .masc { color:var(--orange); }
+  #memBody .memnote { color:var(--fg-dim); font-style:italic; padding-top:2px; }
+  body:not(.paused) #memBody .mrow { opacity:.5; }
   .proc { display:flex; align-items:center; gap:8px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .proc:hover { background:var(--hover); }
   .proc .procname { color:var(--name); overflow:hidden; text-overflow:ellipsis; }
@@ -280,6 +322,12 @@
   /* advanced breakpoint indicators + properties editor */
   .bp .bpcfg { flex:none; margin-left:auto; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
   .bp .bpcfg:hover { color:#fff; background:#3a3a3a; opacity:1; }
+  /* Two breakpoints share this module:line, so remove and properties would be acting on a guess. Still
+     RENDERED - an action that vanishes reads as a rendering bug - but visibly inert, and `cursor:help`
+     because the affordance it has left is its own explanation. The :hover rules above are overridden or
+     they would keep promising the action on mouseover. */
+  .bp .rm.disabled, .bp .bpcfg.disabled { cursor:help; opacity:.25; }
+  .bp .rm.disabled:hover, .bp .bpcfg.disabled:hover { color:var(--muted,#888); background:none; opacity:.25; }
   .bp .badge { flex:none; font-size:10px; line-height:1; padding:1px 4px; border-radius:3px; background:var(--btnhover,#2d2d2d); cursor:help; }
   .bp .badge.cond { color:#c586c0; } .bp .badge.hits { color:var(--num,#b5cea8); } .bp .badge.trace { color:#4fc1ff; } .bp .badge.cnt { color:var(--warn); }
   .bp.has-adv .chk.on { background:#c586c0; border-color:#c586c0; }        /* conditional/hit-count bp dot */
@@ -300,6 +348,12 @@
 
   .srchdr { flex:none; display:flex; align-items:center; gap:5px; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
   .srchdr .file { color:var(--fg); }
+  /* the paused line number, moved here when the redundant run-state band was removed (87c66af6).
+     Same token the other two places the page prints a line number use (.frame .ln, .bp .ln). */
+  .srchdr .ln { color:var(--num); }
+  /* "(Thread 2)" after the location when the listing is another thread's (buildSource). The warn token the
+     thread picker's own "not the stopped thread" state uses. */
+  .srchdr .srcthread { color:var(--warn); }
   #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
@@ -365,6 +419,19 @@
   .kb-act.ghost { background:transparent; color:var(--fg-dim); border:1px solid var(--popup-border); }
   .kb-act.ghost:hover:not([disabled]) { background:var(--btnhover); color:var(--fg); }
   .kb-act[disabled] { opacity:.4; cursor:default; }
+  /* Attach picker (3f2d747f). */
+  .ap-bar { display:flex; align-items:center; gap:8px; margin-top:12px; }
+  .ap-status { flex:1; min-width:0; font-size:11.5px; color:var(--fg-dim); overflow-wrap:anywhere; }
+  .ap-list { margin-top:8px; border:1px solid var(--popup-border); border-radius:4px; max-height:44vh; overflow:auto; }
+  .ap-row { display:grid; grid-template-columns:1fr auto; gap:0 10px; padding:5px 8px; cursor:pointer; }
+  .ap-row + .ap-row { border-top:1px solid var(--popup-border); }
+  .ap-row:hover { background:var(--btnhover); }
+  .ap-row.sel { background:var(--accent); color:#fff; }
+  .ap-name { font-weight:700; overflow-wrap:anywhere; }
+  .ap-pid { font-family:"Cascadia Code",Consolas,monospace; font-size:12px; color:var(--num); }
+  .ap-row.sel .ap-pid, .ap-row.sel .ap-path { color:#fff; }
+  .ap-path { grid-column:1 / -1; font-size:11px; color:var(--fg-dim); overflow-wrap:anywhere; }
+  .ap-foot { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
 </style>
 </head>
 <body>
@@ -378,7 +445,9 @@
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
          surface until a Monaco-side context-menu / gutter trigger exists — that one sends this same message. -->
-    <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px" onclick="send('runtocursor')">▶| Run to Cursor</button>
+    <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px">▶| Run to Cursor</button>
+    <!-- Attach to a running process (3f2d747f); only while no session is running. -->
+    <button class="tbtn" id="btnAttach" title="Attach… — debug a Clarion app that is already running" style="margin-left:2px;padding:0 8px">⇲ Attach…</button>
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -395,8 +464,6 @@
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
-
-  <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="exebar">
     <span class="lbl">Target</span>
@@ -420,7 +487,7 @@
         </div>
       </details>
       <details class="section" open data-sec="stack">
-        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="sec-x" title="Hide section">✕</span></summary>
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="thhover" id="thHover" title="Identify thread by window: off. Click, then point at one of your program's windows."><span class="thhover-ic">⌖</span><span class="thhover-t" id="thHoverText"></span></span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="thwarn" id="thWarn"><span id="thWarnText"></span><span class="thback" id="thBack" title="Show the thread the engine stopped on">Back to stopped thread</span></div>
           <div class="thpick" id="thPick"><div class="thhdr">Read panels against</div><div id="thList"></div></div>
@@ -447,6 +514,13 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Library State <span class="hint">per-thread RTL state</span><span class="sec-refresh" id="libRefresh" title="Refresh Library State">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body mono" id="libBody"><div class="empty">Expand while paused to read the thread's RTL state.</div></div>
       </details>
+      <details class="section" data-sec="memory">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Memory <span class="hint">hex · ASCII · right-click a variable</span><span class="sec-refresh" id="memRefresh" title="Re-read memory">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <div class="body">
+          <div class="listctl memctl"><button id="memPrev" class="sortbtn" title="Previous block">◀</button><input id="memAddr" placeholder="Address, e.g. 0x4A2F10 (Enter)" autocomplete="off" spellcheck="false" /><select id="memLen" title="Bytes per read"><option value="256">256</option><option value="1024">1 KB</option><option value="4096">4 KB</option></select><button id="memNext" class="sortbtn" title="Next block">▶</button></div>
+          <div class="mono" id="memBody"><div class="empty">Pause, then enter an address, or right-click a variable and choose View memory.</div></div>
+        </div>
+      </details>
     </div>
 
     <div class="splitter" id="splitter"></div>
@@ -469,8 +543,8 @@
     <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
     <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
   </div>
-  <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div></div>
-  <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div></div>
+  <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div><div class="mi" id="tmMem">⌗ View memory</div></div>
+  <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div><div class="mi" id="miSetIp">➜ Set next statement</div></div>
   <div class="ctxmenu" id="procMenu"><div class="mi" id="miBpEntry">⛔ Break on entry</div></div>
 
   <div class="modal-backdrop" id="settingsBackdrop">
@@ -484,6 +558,19 @@
     <div class="modal" role="dialog" aria-label="About CA Debugger">
       <div class="modal-head"><span>About CA Debugger</span><span class="modal-x" id="aboutClose" title="Close">✕</span></div>
       <div class="modal-body" id="aboutBody"></div>
+    </div>
+  </div>
+
+  <!-- Attach picker (3f2d747f). Every process name and path is written with textContent: they are the
+       processes' own strings, and ticket e1dea0d9 audits exactly this surface. -->
+  <div class="modal-backdrop" id="attachBackdrop">
+    <div class="modal" role="dialog" aria-label="Attach to process">
+      <div class="modal-head"><span>Attach to a running process</span><span class="modal-x" id="attachClose" title="Close">✕</span></div>
+      <div class="modal-body">
+        <div class="ap-bar"><span class="ap-status" id="attachStatus"></span><button class="kb-act ghost" id="attachRefresh">Refresh</button></div>
+        <div class="ap-list" id="attachList"></div>
+        <div class="ap-foot"><button class="kb-act ghost" id="attachCancel">Cancel</button><button class="kb-act" id="attachGo" disabled>Attach</button></div>
+      </div>
     </div>
   </div>
 
@@ -501,7 +588,12 @@
   // here. Relabelling the panels on dispatch left them holding one thread's values under another
   // thread's name whenever a command was dropped, which is the exact failure this ticket exists to stop.
   function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
-  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  // Escapes quotes as well as & < >: esc() output lands inside quoted attributes (data-n, data-name,
+  // data-va), and before 2026-09-24 a `"` in a debuggee symbol name broke out of them (e1dea0d9).
+  // \x22 and \x27 rather than literal quotes: tools/lib-extract.ps1 brace-matches this out with a C#
+  // string scanner, and a bare quote inside a regex literal reads to it as an unterminated string.
+  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                                                .replace(/\x22/g,'&quot;').replace(/\x27/g,'&#39;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
@@ -545,7 +637,14 @@
     {id:'stepinto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
     {id:'stepout',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
     {id:'stop',     label:'Stop',      tip:'Terminate the debug session and the target process'},
+    // Not a host command: it opens the picker, which sends `procs` and then `attach <pid>` (see openAttach).
+    {id:'attach',   label:'Attach…',   tip:'Attach to a Clarion app that is already running'},
   ];
+  // While ATTACHED, Stop detaches and the app keeps running (3f2d747f): the host sends the engine `detach`, never
+  // `quit`. The tip must say so, rather than promise to terminate an app the user did not start here.
+  const STOP_TIP_ATTACHED='Detach (the app keeps running)';
+  let attachMode=false;
+  function cmdTip(c){ return c.id==='stop' && attachMode ? STOP_TIP_ATTACHED : c.tip; }
   let keyBinds = {};      // cmd id -> combo string (e.g. 'Ctrl+Alt+S'); absent/empty = unbound
   let capturing = null;   // cmd id currently being rebound, or null
 
@@ -576,7 +675,7 @@
       const cap=capturing===c.id, bind=keyBinds[c.id];
       const chipCls = cap ? 'kb-chip capturing' : (bind ? 'kb-chip' : 'kb-chip unbound');
       const chipTxt = cap ? 'press a key…  (Esc cancels)' : (bind || 'unbound');
-      rows += '<div class="kb-row"><span class="kb-label">'+esc(c.label)+'</span>'
+      rows += '<div class="kb-row"><span class="kb-label" data-kbl="'+c.id+'">'+esc(c.label)+'</span>'
         + '<span class="'+chipCls+'">'+esc(chipTxt)+'</span>'
         + '<button class="kb-act" data-rebind="'+c.id+'">'+(cap?'Cancel':'Rebind')+'</button>'
         + '<button class="kb-act ghost" data-clear="'+c.id+'"'+(bind?'':' disabled')+'>Clear</button></div>';
@@ -585,6 +684,8 @@
       '<div class="set-section"><div class="set-h">Keyboard Shortcuts</div>'
       + '<div class="set-note">The Clarion IDE claims F5 / F10 / F11, so debug commands ship unbound. Click <b>Rebind</b>, then press a key combination the IDE doesn\'t use.</div>'
       + '<div class="kb-list">'+rows+'</div></div>';
+    // Each label carries its command's tip, set as a property (not markup) so it tracks attach mode.
+    $('settingsBody').querySelectorAll('[data-kbl]').forEach(l=>{ const c=KB_CMDS.find(k=>k.id===l.dataset.kbl); if(c) l.title=cmdTip(c); });
     $('settingsBody').querySelectorAll('[data-rebind]').forEach(b=>b.onclick=()=>{ const id=b.dataset.rebind; capturing===id?endCapture():startCapture(id); });
     $('settingsBody').querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{ const id=b.dataset.clear; delete keyBinds[id]; saveBinds(); renderSettings(); });
   }
@@ -657,14 +758,36 @@
   // ---- Target bar --------------------------------------------------------------------------
   // textContent throughout: the path comes from the host, but it is a filesystem string we do not
   // control the contents of, and this file has had a DOM-XSS bug of exactly that shape before.
+  // `state` (0214f33a): auto | manual | unconfirmed | none. ABSENT means an older host, which renders exactly
+  // as before. A value we do not know is read as "unconfirmed": a newer host's state that this page cannot
+  // interpret must not be shown as the authoritative target.
+  var TARGET_STATES=['auto','manual','unconfirmed','none'];
+  function targetState(m){
+    if(!m || m.state===undefined || m.state===null) return null;
+    return TARGET_STATES.indexOf(m.state)>=0 ? m.state : 'unconfirmed';
+  }
   var targetPath=null;
   function setTarget(m){
     var el=$('exePath');
-    targetPath = m && m.path ? m.path : null;
+    var st=targetState(m), note=(m && typeof m.note==='string') ? m.note : '';
+    targetPath = (st!=='none' && m && m.path) ? m.path : null;
     if(!targetPath){
       el.className='path none';
-      el.textContent='No target resolved — open a project, or build the app.';
+      el.textContent='No target resolved — open a project, or build the app.'+(note ? ' '+note : '');
       el.title='';
+      return;
+    }
+    if(st==='unconfirmed'){
+      // Built from spans, never markup: both the path and the note are strings we do not control.
+      el.className='path unconfirmed';
+      el.textContent='';
+      var mk=document.createElement('span'); mk.className='tmark'; mk.textContent='⚠';
+      var pt=document.createElement('span'); pt.className='tpath'; pt.textContent=targetPath;
+      el.appendChild(mk); el.appendChild(pt);
+      if(note){ var nt=document.createElement('span'); nt.className='tnote'; nt.textContent=note; el.appendChild(nt); }
+      el.title='NOT confirmed for the current solution — kept only to retry, and it may not be the app you mean.'
+              +(m.exists ? '' : ' Not on disk.')+(note ? '\n'+note : '')+'\nClick to show it in File Explorer.';
+      restoreWatchesFor(targetPath);
       return;
     }
     el.className = m.exists ? 'path' : 'path missing';
@@ -678,10 +801,79 @@
   }
   $('exePath').onclick=function(){ if(targetPath) send('revealexe'); };
 
+  $('btnRtc').onclick=function(){ send('runtocursor'); };
   $('btnDocs').onclick=function(){ send('opendocs'); };
   $('btnAbout').onclick=openAbout;
   $('aboutClose').onclick=closeAbout;
   $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
+
+  // ---- Attach to a running process (3f2d747f) ------------------------------------------------
+  // The picker asks the host for `procs` and shows what comes back; picking a row sends `attach` with that
+  // row's pid. The host honours only a pid it listed in its latest reply, and one listing authorises one
+  // attach, so the picker asks afresh every time it opens.
+  //
+  // EVERY NAME AND PATH IS TEXT. They are the running processes' own strings, which this page does not
+  // control, so they are written with textContent and title (a property, not markup) and never go through
+  // innerHTML - not even escaped. The rows carry only the pid, a number checked here, as data.
+  let attachSel=null;   // the pid of the selected row, or null
+  function attachOpen(){ return $('attachBackdrop').classList.contains('show'); }
+  function openAttach(){
+    if(runState!=='idle'){ toast('Stop the current session before attaching'); return; }
+    attachSel=null;
+    $('attachGo').disabled=true;
+    $('attachList').textContent='';
+    $('attachStatus').textContent='Looking for running Clarion apps…';
+    $('attachBackdrop').classList.add('show');
+    send('procs');
+  }
+  function closeAttach(){ $('attachBackdrop').classList.remove('show'); }
+  function selectAttachRow(pid){
+    attachSel=pid;
+    $('attachList').querySelectorAll('.ap-row').forEach(r=>r.classList.toggle('sel', r.dataset.pid===String(pid)));
+    $('attachGo').disabled = attachSel==null;
+  }
+  function attachPick(pid){
+    if(pid==null || runState!=='idle') return;
+    closeAttach();
+    send('attach', String(pid));
+  }
+  function renderProcs(m){
+    const list=$('attachList');
+    list.textContent='';
+    attachSel=null; $('attachGo').disabled=true;
+    const procs=(m && Array.isArray(m.procs)) ? m.procs : [];
+    let shown=0;
+    procs.forEach(p=>{
+      // A pid is a positive integer or the row is not shown: it is the one thing the host is sent back.
+      if(!p || !Number.isInteger(p.pid) || p.pid<=0) return;
+      const row=document.createElement('div'); row.className='ap-row'; row.dataset.pid=String(p.pid);
+      const name=document.createElement('span'); name.className='ap-name'; name.textContent=p.name==null?'':String(p.name);
+      const pid=document.createElement('span'); pid.className='ap-pid'; pid.textContent='pid '+p.pid;
+      const path=document.createElement('span'); path.className='ap-path'; path.textContent=p.path==null?'':String(p.path);
+      row.title=p.path==null?'':String(p.path);
+      row.appendChild(name); row.appendChild(pid); row.appendChild(path);
+      row.onclick=()=>selectAttachRow(p.pid);
+      row.ondblclick=()=>attachPick(p.pid);
+      list.appendChild(row);
+      shown++;
+    });
+    $('attachStatus').textContent = m && m.error ? 'Could not list processes: '+String(m.error)
+      : shown ? shown+' running app(s) with Clarion debug info. Pick one and press Attach.'
+      : 'No running app with Clarion debug info was found. Start the app, then press Refresh.';
+  }
+  $('btnAttach').onclick=function(){ openAttach(); };
+  $('attachClose').onclick=closeAttach;
+  $('attachCancel').onclick=closeAttach;
+  $('attachRefresh').onclick=()=>{ $('attachStatus').textContent='Looking for running Clarion apps…'; send('procs'); };
+  $('attachGo').onclick=()=>attachPick(attachSel);
+  $('attachBackdrop').addEventListener('click',e=>{ if(e.target===$('attachBackdrop')) closeAttach(); });
+  // The host says `attachmode on` once an attach session starts; going idle turns it off (setRunState).
+  function setAttachMode(on){
+    attachMode=!!on;
+    document.body.classList.toggle('attached', attachMode);
+    $('runstate').title = attachMode ? 'Attached to a running app. Stop: '+STOP_TIP_ATTACHED+'.' : '';
+    if(settingsOpen()) renderSettings();   // the Stop row's tip changes with the mode
+  }
 
   document.addEventListener('keydown',e=>{
     // 1) capture mode — record the next combo for the command being rebound
@@ -698,6 +890,8 @@
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
     // 2b) same for About — a modal must swallow debug shortcuts, not just look modal
     if(aboutOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAbout(); } return; }
+    // 2c) and for the attach picker
+    if(attachOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAttach(); } return; }
     // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
     // condition evaluator is the source of truth for whether a command is valid in the current state; the
     // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
@@ -707,6 +901,7 @@
     const c=KB_CMDS.find(c=>keyBinds[c.id]===combo);
     if(!c) return;
     e.preventDefault();
+    if(c.id==='attach'){ openAttach(); return; }   // a picker, not a command: the host needs a listed pid
     send(c.id);
   });
 
@@ -727,11 +922,11 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate','memory'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', source:'Source', console:'Debug Console'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true}; // only collapsible (<details>) panels; matches markup
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', memory:'Memory', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true, memory:true}; // only collapsible (<details>) panels; matches markup
   let layoutLoaded=false, dragSec=null;
 
   function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
@@ -893,14 +1088,15 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
-    // Every state must write the status line. Only 'idle' used to, so once a session started the
-    // bar kept the idle text — the app was visibly running while the bar still read "Not running —
-    // press Start on the IDE toolbar." The paused text is written by the pause handler, which has
-    // the procedure/module/line to name; the states below have nothing to add, so they say what is
-    // true and no more.
-    if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
-    else if(state==='launching'){ $('locbar').textContent='Launching…'; }
-    else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
+    // Attach is offered only with no session (body.idle gates the button); a session's end also ends attach mode.
+    document.body.classList.toggle('idle', runState==='idle');
+    if(runState==='idle' && attachMode) setAttachMode(false);
+    // The run state itself is the indicator above (dot + text) and nothing else needs to restate it:
+    // the band that used to sit under the header said the same thing in words, was written from here
+    // while the indicator was written two lines up, and the two could disagree — it could read
+    // "Not running" while the dot said running (87c66af6).
+    // Going idle still clears the source panel, which is a real action, not a caption.
+    if(state==='idle') clearSrc();
   }
 
   // ---- the Watch list survives closing Clarion (ticket 08adccc7) ----
@@ -1022,9 +1218,11 @@
     row.addEventListener('contextmenu',e=>{ e.preventDefault();
       if(!selSet.has(row)) selOne(row);
       const n=selSet.size; $('tmWatch').textContent='👁 Add to Watch'+(n>1?' ('+n+')':'');
+      memMenuFor(row.dataset.addr, true);   // the right-clicked row's own address, not the selection's
       const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
   $('tmWatch').onclick=()=>{ addWatchMany(Array.from(selSet).map(r=>r.dataset.name).filter(Boolean)); $('treeMenu').classList.remove('show'); selSet.clear(); applySel(); };
+  $('tmMem').onclick=()=>{ $('treeMenu').classList.remove('show'); openMemoryAt(_memMenuAddr); };
   document.addEventListener('click',()=>{ $('treeMenu').classList.remove('show'); $('srcMenu').classList.remove('show'); $('procMenu').classList.remove('show'); });
 
   // ---- Source view: right-click "Run to cursor" (one-shot bp at the line, then resume). Only meaningful
@@ -1035,11 +1233,32 @@
     e.preventDefault();
     rtcLine=parseInt(sl.dataset.line,10);
     $('miRtc').classList.toggle('disabled', !paused);
+    $('miSetIp').classList.toggle('disabled', !setIpAllowed());
     const m=$('srcMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
   });
   $('miRtc').onclick=()=>{ $('srcMenu').classList.remove('show');
     if(!paused||rtcLine==null||isNaN(rtcLine)||!curFile) return;
     send('runtocursor', curFile+':'+rtcLine); };
+
+  // ---- Source view: right-click "Set next statement" (task a77abd94). Moves the STOPPED thread's instruction
+  // pointer to the clicked line; nothing runs. Only while paused AND viewing the stopped thread: the engine
+  // refuses another thread anyway, and a greyed item says so before the round trip. The engine decides which
+  // moves it allows (same procedure, stack proven or observed, ...) and its refusal sentence is shown as is. What it CANNOT
+  // decide is what skipping or repeating code means to the program, so the first use in a session says that
+  // once, in the console, where it stays readable. ----
+  let setIpWarned=false;
+  function setIpAllowed(){ return paused && !viewingOtherThread(); }
+  function setIpFromMenu(){ $('srcMenu').classList.remove('show');
+    if(!setIpAllowed()||rtcLine==null||isNaN(rtcLine)||!curFile) return;
+    if(!setIpWarned){ setIpWarned=true;
+      logLine('pause', 'Set next statement skips or repeats code without running anything in between. The debugger only allows a move '
+        + 'where the stack depth is proven or was seen at that line, and it does nothing about the program\'s own state: '
+        + 'skipping an OPEN leaves a file or window closed, and repeating a line repeats its effects.'); }
+    send('setip', curFile+':'+rtcLine); }
+  $('miSetIp').onclick=setIpFromMenu;
+  // The host's relay of the engine's setip reply. Success needs nothing here: the `paused` that follows repaints
+  // the execution line and every panel.
+  function onSetIp(m){ if(!m.ok) toast(m.error || ('Set next statement refused (' + (m.reason||'?') + ')')); }
 
   // ---- Procedures pane: right-click "Break on entry" (persistent bp at the procedure's definition line).
   // Works in any state (idle stages it; running/paused plants it live). Delegated for buildProcs() rebuilds. ----
@@ -1047,13 +1266,15 @@
   $('procList').addEventListener('contextmenu',e=>{
     const row=e.target.closest('.proc'); if(!row) return;
     e.preventDefault();
-    procCtx={ name:row.dataset.name||'', module:row.dataset.module||'', line:parseInt(row.dataset.line||'0',10) };
+    procCtx={ id:row.dataset.pid||'', name:row.dataset.name||'' };
     const m=$('procMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
   });
   $('miBpEntry').onclick=()=>{ $('procMenu').classList.remove('show');
-    if(!procCtx||!procCtx.module||!procCtx.line||isNaN(procCtx.line)) return;
-    // module+line FIRST so the host's minimal JSON parser reads them before the (untrusted) proc name
-    send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
+    if(!procCtx||!procCtx.id) return;
+    // Only the row's id goes back (afbc68c7). The host issued it with the list and resolves it to a module
+    // and line on its own side, so nothing the page holds - including a name out of the debuggee's own
+    // symbols - decides where the breakpoint lands.
+    send('breakonprocentry', JSON.stringify({ id:procCtx.id })); };
   function removeWatch(name){ const k=watchedKey(name);
     // saveWatches() on removal too, or a name you deleted comes back at the next startup. With no target
     // resolved there is nowhere to write it, so remember that a removal is outstanding — see untargetedRemoval.
@@ -1112,8 +1333,9 @@
   }
 
   // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
-  // hex/number metadata — safe in attributes); empty string for non-editable rows.
-  function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  // hex/number metadata); empty string for non-editable rows. Escaped anyway, so the attributes stay
+  // well-formed whatever the reply carries rather than by where the values came from.
+  function editAttrs(v){ return v.va ? (' data-va="'+esc(v.va)+'" data-tc="'+esc(v.typeCode)+'" data-sz="'+esc(v.size||0)+'" data-pl="'+esc(v.places||0)+'"') : ''; }
   // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
   // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
   // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
@@ -1122,11 +1344,48 @@
   // inserts its own .vas tag after the same cell and runs AFTER wireEdit, so on a DATE/TIME/integer row the
   // order is [vval, vas, vedit-btn] and a nextElementSibling check silently leaves the pencil behind.
   // A handle also stays correct if a row ever holds more than one editable cell.
+  //
+  // This is the EDIT half only — it deliberately leaves the DATE/TIME view-as state alone, because one
+  // caller (selectThread) wants exactly that: close the write path without disturbing what is on screen.
+  // Everyone else wants clearValueMeta below. If you are about to add a third caller, it is almost
+  // certainly that one.
   function clearEditMeta(cell){
     if(!cell) return;
     cell.classList.remove('editable');
     delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
     if(cell._vedit){ cell._vedit.remove(); cell._vedit=null; }
+  }
+  // THE owner of clear-on-reuse for a value cell. A cell carries per-reply state in two families — the
+  // edit metadata above, and dtApply's DATE/TIME view-as tag with its cached raw value — and a row is
+  // REUSED across stops, so a reply that resolves to nothing has to drop both. It used to drop only the
+  // first: applyValue's miss branch called clearEditMeta and returned before dtApply, leaving a live .vas
+  // tag whose click handler (dtCycle) re-renders the cell from the stale dataset.raw — resurrecting the
+  // PREVIOUS value's text on a row the engine has just said it cannot read. The tag's own title quotes
+  // that old raw number too, and beginEdit pre-fills its editor from dataset.raw (gated on dataset.va,
+  // which clearEditMeta does drop — so the write path is fenced off by that guard alone).
+  //
+  // The correct clearing existed, but only inline inside invalidateThreadScopedState, which is how the two
+  // sites came to clear different SUBSETS of the same state. One function owns it now; that is the fix.
+  //
+  // The DATE/TIME half is its OWN function for the same reason, one ticket later (ec45805f item 1): a
+  // THIRD site was clearing it inline — dtApply's "this is not a number after all" branch — and it cannot
+  // just call clearValueMeta, because dtApply runs AFTER wireEdit and that would strip the edit metadata
+  // the pencil was just given. So the split is by FAMILY, and each caller takes the half it means:
+  //   clearEditMeta  — the write path only          (selectThread: close it, disturb nothing on screen)
+  //   clearDtMeta    — the view-as tag only         (dtApply: this cell holds no number to view)
+  //   clearValueMeta — both, for a reused cell      (everyone else)
+  // clearValueMeta also drops the reply's frame label (_vframe, see applyValue): it is per-reply state of
+  // the same cell, and a row reused on another thread or at another stop must not keep naming a frame.
+  function clearDtMeta(cell){
+    if(!cell) return;
+    if(cell._vas){ cell._vas.remove(); cell._vas=null; }
+    delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode;
+  }
+  function clearValueMeta(cell){
+    if(!cell) return;
+    clearEditMeta(cell);
+    clearDtMeta(cell);
+    if(cell._vframe){ cell._vframe.remove(); cell._vframe=null; }
   }
   // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
   // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
@@ -1156,6 +1415,11 @@
     // The trailing `i` is the whole fix for the reported symptom: a reply for one spelling resolves the
     // rows keyed in another, instead of leaving them on "…" for the rest of the session.
     document.querySelectorAll('[data-name="'+cssEsc(name)+'" i]').forEach(row=>{
+      // "View memory" on a Globals/Tables row follows THIS reply's own-storage address (04b9679e): the
+      // engine sends addr only for the thread's own data, never for the shared THREAD template, and the
+      // page never computes one. Only rows renderSymRow built carry _addrFromWatch: a Variables-tree row
+      // with the same name holds the engine's addr from its own row data, which a reply must not touch.
+      if(row._addrFromWatch){ if(found && meta && meta.addr) row.dataset.addr=meta.addr; else delete row.dataset.addr; }
       const v=row.querySelector('.vval'); if(!v) return;
       // 'idle' belongs in this list as much as 'pending': a restored row is answered at the first pause
       // WITHOUT being re-rendered, so leaving the class on would show a real value in the grey-italic
@@ -1167,7 +1431,10 @@
       // existing pencil — so without this a row that resolved to thread A's instance would keep A's va and
       // its pencil when a later stop reports the value unreadable or not-yet-allocated, and committing an
       // edit would write ANOTHER thread's memory while the row shows the template value.
-      clearEditMeta(v);
+      //
+      // clearValueMeta, not clearEditMeta: the DATE/TIME view-as tag caches the previous reply's raw value
+      // and must go with it. On the found path dtApply below puts a fresh tag back from the new value.
+      clearValueMeta(v);
       if(!found){
         // Three distinct misses, and every one of them RESOLVES the row — a value that can't be read must
         // never leave "…" sitting there looking like it's still loading.
@@ -1186,6 +1453,14 @@
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
       applyNote(v, meta && meta.note);   // …then the caveat, which must win the tooltip back off dtApply
+      // A local that resolved in a CALLER's frame says which one, so it is not read as the current
+      // procedure's. clearValueMeta above removed the previous reply's label.
+      if(meta && Number.isInteger(meta.frameIdx) && meta.frameIdx>0){
+        const ft=document.createElement('span'); ft.className='vframe';
+        ft.textContent='frame '+meta.frameIdx+(meta.frameProc?' · '+meta.frameProc:'');
+        ft.title='Read from frame '+meta.frameIdx+' of the call stack'+(meta.frameProc?' ('+meta.frameProc+')':'')+', not the current procedure.';
+        v.insertAdjacentElement('beforebegin', ft); v._vframe=ft;
+      }
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -1201,7 +1476,10 @@
       }
     });
   }
-  function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
+  // A CSS string body: quote and backslash escaped, and control characters as hex escapes, since a raw
+  // newline in a selector string makes querySelectorAll THROW (and applyValue with it). U+0000 cannot be
+  // expressed in CSS at all (it parses as U+FFFD), so a name containing one simply matches no row.
+  function cssEsc(s){ return String(s).replace(/["\\]/g,'\\$&').replace(/[\x00-\x1f\x7f]/g,c=>'\\'+c.charCodeAt(0).toString(16)+' '); }
 
   // ---- edit-variable-value: double-click a value cell to write a new value into the live process ----
   let isPaused=false;
@@ -1228,10 +1506,13 @@
       if(finished) return; finished=true; cell._editing=false;
       if(activeEdit && activeEdit.cell===cell) activeEdit=null;
       cell.textContent=old;                 // restore now; a successful write repaints via the 'varset' reply
-      // tid BEFORE value: the host's minimal JSON reader takes the FIRST "key": it finds anywhere in the
-      // text, and `value` is the one field here the user typed — it could otherwise carry its own "tid".
       // The tid names the thread this address was read on, so the engine can refuse a write whose thread
       // is no longer the selected one instead of writing another thread's memory.
+      // It used to be ordered BEFORE `value` because the host's scanner took the first `"key":` it found
+      // anywhere in the text, so a user-typed value containing "tid" could impersonate this field. That
+      // reader is gone (ae5b678a stage 1): JsonMessageReader tracks string state and matches only
+      // top-level members, so a "tid" inside a string value is text. Order is not carrying the rule here
+      // and must not be mistaken for it — the guarantee is the reader's, and it holds whatever the order.
       if(commit){
         send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size,
                                         places:meta.places, tid:(selTid==null?null:selTid), value:inp.value}));
@@ -1302,7 +1583,9 @@
   function dtApply(cell, name, rawText){
     if(!cell) return;
     const n=dtParseInt(rawText!=null?rawText:cell.dataset.raw!=null?cell.dataset.raw:cell.textContent);
-    if(n===null){ if(cell._vas){ cell._vas.remove(); cell._vas=null; } delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode; return; }
+    // Not a number: drop the view-as half and leave the edit half alone. NOT clearValueMeta — dtApply runs
+    // after wireEdit, so that would strip the pencil's metadata this reply has just set.
+    if(n===null){ clearDtMeta(cell); return; }
     cell.dataset.raw=String(n); cell.dataset.dtname=name||'';
     const mode=dtModeFor(name, n); cell.dataset.dtmode=mode;
     cell.textContent = mode==='date'?fmtClarionDate(n) : mode==='time'?fmtClarionTime(n) : String(n);
@@ -1342,7 +1625,9 @@
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
   // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
   // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
-  function renderVarGroup(el, label, extra, items){
+  // `localTree`: the rows are the paused frame's LOCALS, so a top-level &QUEUE/&GROUP's members are watchable
+  // through it (see childWatchPath). Module Data passes false.
+  function renderVarGroup(el, label, extra, items, localTree){
     if(!el) return;
     el.innerHTML='';
     if(!items.length) return;
@@ -1352,18 +1637,36 @@
       +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+arr.length+'</span>';
     el.appendChild(hdr);
     const state={open:true};
-    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label); const hay=varHay(v);
+    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label, v.name||null, !!localTree); const hay=varHay(v);
       h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
     function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
     hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
     applyAll();
   }
 
+  // The WATCH path of a child row (HEAD.MEMBER[.MEMBER], ticket 3a0c915d), or null when the engine has no
+  // way to resolve one. The engine walks direct GROUP/QUEUE members from the head, and follows ONE reference:
+  // a LOCAL &QUEUE/&GROUP at the head (QUEUE:BROWSE:1 is one). So the path stops (null, for the child and
+  // everything under it) at an array or one of its "[n]" elements, at a reference anywhere below the head,
+  // and at a reference head that is not a local (Module Data). The head must also carry the engine's
+  // `refKind` "aggregate" (a QUEUE or GROUP; TSWD cannot tell those two apart), decided engine-side by the
+  // same LooksLikeClassLayout test the watch walker refuses a class head with, so the pin and the engine
+  // agree. "class", "other", or no refKind at all (an engine from before that field) gets no path: an
+  // older engine means fewer pins rather than pins that answer an error.
+  function childWatchPath(parentWatchPath, parent, parentDepth, refHeadOk, child){
+    if(parentWatchPath==null || !parent || !child || !child.name) return null;
+    if(/^\[/.test(child.name) || /^ARRAY/.test(parent.type||'')) return null;
+    if(parent.ref && !(parentDepth===1 && refHeadOk && parent.refKind==='aggregate')) return null;
+    return parentWatchPath+'.'+child.name;
+  }
+
   // Render one variable row into `container`, with its descendants in a child box inserted right after it
   // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
-  // `parentPath` is the dotted name-path of this row's ancestors — used only to persist expand-state (see
-  // openPaths above) across re-renders; it carries no other meaning.
-  function renderVarRow(container, v, depth, parentPath){
+  // `parentPath` is the '>'-joined name-path of this row's ancestors — used only to persist expand-state
+  // (see openPaths above) across re-renders; it is NOT a watch name. `watchPath` is this row's own watch
+  // name, or null when it has none (see childWatchPath); `refHeadOk` says a top-level reference in this
+  // tree is a LOCAL, whose members the engine can reach through it.
+  function renderVarRow(container, v, depth, parentPath, watchPath, refHeadOk){
     const path = (parentPath||'')+'>'+(v.name||'');
     const eager = v.children || null;            // DIRECT group: members already supplied
     const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
@@ -1383,27 +1686,29 @@
     // for the SAME name at the SAME stop says otherwise.
     applyNote(row.querySelector('.vval'), v.note);
 
-    // TOP-LEVEL scalar leaf (a local or module-data item): make it watchable by name — pin star + right-click
-    // "Add to Watch", the same affordances a Global gets. Watches resolve against the current frame FIRST (a
-    // local shadows a global), so a local name added here tracks its live stack slot. Gated to depth===1:
-    // NESTED group/queue members (e.g. BRW1::JOB:JOBID inside QUEUE:BROWSE:1) have no standalone resolvable
-    // name — the engine reads them by address while walking the group, but the watch-by-name resolver only
-    // knows top-level local entries and globals, so watching a member would just show "(not found)". They
-    // stay visible with live values (and the edit pencil); they just don't get a misleading watch button.
-    if(!expandable && v.name && depth===1){
+    // A LEAF with a watch path is watchable — pin star + right-click "Add to Watch", the same affordances a
+    // Global gets. A top-level row's path is its own name; a member's is HEAD.MEMBER (e.g.
+    // QUEUE:BROWSE:1.BRW1::JOB:JOBID), which the engine re-resolves by name at every pause, so nothing
+    // address-bound is stored and a restored watch list still means the same variables. Watches resolve
+    // against the current frame FIRST (a local shadows a global). A nested row sends its FULL path, never
+    // the bare leaf name, which for a global could name some other container's field. Rows with no path
+    // (under an array, or through a reference the engine does not follow) keep their live values and the
+    // edit pencil; they just don't get a watch button that could only answer "(not found)".
+    if(!expandable && watchPath){
       row.classList.add('selrow');
-      row.dataset.name=v.name;
+      row.dataset.name=watchPath;
       const pin=document.createElement('span'); pin.className='pin'; pin.title='Add to Watch'; pin.innerHTML=STAR;
-      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(v.name); };
+      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(watchPath); };
       row.appendChild(pin);
       wireSel(row);
     }
+    wireMemMenu(row, v);   // "View memory" for any row with storage; after the gate, which decides selrow
 
     let box=null, open=false, loaded=false;
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
-      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path));
+      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path, childWatchPath(watchPath, v, depth, refHeadOk, c), refHeadOk));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
     if(eager && eager.length){ renderKids(eager); loaded=true; }
 
@@ -1477,19 +1782,115 @@
     lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState();
   }
 
+  // ---- Memory panel: a hex + ASCII dump of the debuggee at an address (ticket 633d8b2f) ----
+  // Read-only and paused-only: the host forwards `mem` only while paused and the engine caps a read at
+  // MEM_MAX bytes, so the panel pages in blocks of at most that. Like Library State it reads only while it
+  // is open, re-reads on each stop, and keeps the last dump on resume, dimmed (CSS keys on body.paused).
+  // Replies are matched on reqId and anything but the newest is dropped. They are NOT tid-gated: memory
+  // belongs to the process, not to a thread.
+  const MEM_MAX=4096, MEM_TOP=0x100000000;
+  let _memReq=0, memAddr=null, memLen=256, lastMem=null, memInFlight=null, _memMenuAddr=null;
+  // A typed address: hex, with or without 0x, at most 8 digits. null for anything else.
+  function memParseAddr(s){
+    const t=String(s==null?'':s).trim().replace(/^0x/i,'');
+    return /^[0-9a-f]{1,8}$/i.test(t) ? parseInt(t,16) : null;
+  }
+  function memHex(n){ return '0x'+n.toString(16).toUpperCase().padStart(8,'0'); }
+  // Where a block of `len` bytes may start: not below 0, and not so high it runs past 4 GB (the engine
+  // refuses that span rather than wrapping it).
+  function memClampStart(a, len){ return Math.max(0, Math.min(a, MEM_TOP-len)); }
+  // The reply's hex string as 16-byte rows: {addr, hex, ascii}. Printable ASCII only; everything else is '.'.
+  function memRows(base, hex, read){
+    const rows=[]; const n=Math.min(read|0, (hex||'').length>>1);
+    for(let r=0;r<n;r+=16){
+      const cells=[]; let asc='';
+      for(let i=r;i<Math.min(r+16,n);i++){
+        const b=parseInt(hex.substr(i*2,2),16);
+        cells.push(hex.substr(i*2,2).toUpperCase());
+        asc+=(b>=0x20 && b<0x7F) ? String.fromCharCode(b) : '.';
+      }
+      while(cells.length<16) cells.push('  ');
+      rows.push({addr:memHex(base+r), hex:cells.slice(0,8).join(' ')+'  '+cells.slice(8).join(' '), ascii:asc});
+    }
+    return rows;
+  }
+  function memIsOpen(){ const el=secEl('memory'); return !!(el && el.open && !isHidden(el)); }
+  function refreshMem(){
+    if(memAddr===null || !isPaused || !memIsOpen()){ renderMem(); return; }
+    const key=memAddr+'|'+memLen; if(memInFlight===key) return;   // the same read is already on its way
+    memInFlight=key; send('mem', (++_memReq)+'|'+memHex(memAddr)+'|'+memLen); renderMem();
+  }
+  function onMem(m){
+    if(+m.reqId!==_memReq) return;
+    memInFlight=null; lastMem=m; renderMem();
+  }
+  // A new stop, or ↻: re-read even if the last request was never answered (the host drops a `mem` it
+  // receives while running, so a reply is not guaranteed and the in-flight mark must not outlive the stop).
+  function memReread(){ memInFlight=null; refreshMem(); }
+  function renderMem(){
+    const box=$('memBody'); if(!box) return;
+    if(memAddr===null){ box.innerHTML='<div class="empty">Pause, then enter an address, or right-click a variable and choose View memory.</div>'; return; }
+    const m=lastMem;
+    if(!m || memParseAddr(m.addr)!==memAddr){ box.innerHTML='<div class="empty">'+(isPaused?'Reading…':'Pause to read memory.')+'</div>'; return; }
+    if(m.error){ box.innerHTML='<div class="empty">'+esc(m.error)+'</div>'; return; }
+    box.innerHTML=memRows(memAddr, m.bytes, m.read).map(r=>
+      '<div class="mrow"><span class="madr">'+r.addr+'</span><span class="mhex">'+r.hex+'</span><span class="masc">'+esc(r.ascii)+'</span></div>').join('')
+      +((m.read|0)<(m.len|0) ? '<div class="memnote">'+(m.read|0)+' of '+(m.len|0)+' bytes readable; the rest is not mapped</div>' : '');
+  }
+  function memGo(a){
+    if(a===null) return;
+    memAddr=memClampStart(a, memLen); lastMem=null;
+    const inp=$('memAddr'); if(inp){ inp.value=memHex(memAddr); inp.classList.remove('bad'); }
+    refreshMem();
+  }
+  // "View memory" on a variable row: open the panel (un-hiding it if needed) at that row's address.
+  function openMemoryAt(addr){
+    const a=memParseAddr(addr); if(a===null) return;
+    const el=secEl('memory'); if(!el) return;
+    if(isHidden(el)) showSection('memory');
+    if(!el.open) el.open=true;   // its 'toggle' fires later and finds this read already in flight
+    memGo(a);
+    if(el.scrollIntoView) el.scrollIntoView({block:'nearest'});
+  }
+  // The tree menu for one row: "View memory" only when the row has storage (`addr`, else an edit `va`),
+  // "Add to Watch" only when the row is a watchable top-level name (wireSel's rows).
+  function memMenuFor(addr, watchable){
+    _memMenuAddr=addr||null;
+    $('tmWatch').style.display=watchable?'':'none';
+    $('tmMem').style.display=_memMenuAddr?'':'none';
+  }
+  // Rows wireSel does not own (groups, arrays, references, nested members) still get "View memory".
+  // A Globals/Tables row (_addrFromWatch) is wired with no address yet: its address arrives, and goes, with
+  // each watch reply (applyValue), so the handler reads it at the click and offers nothing while it has none.
+  function wireMemMenu(row, v){
+    const a=v.addr||v.va;
+    if(a) row.dataset.addr=a;
+    else if(!row._addrFromWatch) return;           // no storage, and no reply will ever give it one
+    if(row.classList.contains('selrow')) return;   // wireSel's handler shows the menu for these
+    row.addEventListener('contextmenu',e=>{ const cur=row.dataset.addr; if(!cur) return;
+      e.preventDefault(); e.stopPropagation();
+      memMenuFor(cur, false);
+      const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
+  }
+
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
   // Raw data kept so the sort toggle can re-render without re-fetching.
   let lastModule='', lastModuleItems=null, lastSymbols=null;
   function buildModuleData(module, items){ lastModule=module; lastModuleItems=items||[]; renderModuleData(); }
-  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[]); applyVarFilter(); }
+  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[], false); applyVarFilter(); }
 
   // ---- current-frame locals mirrored into the Variables pane ("Local Variables" section) ----
-  // Same data the Call Stack shows for frame 0, surfaced in the Variables pane so locals sit alongside
-  // Global Variables and get the pin / right-click "Add to Watch" affordances. Refreshed every pause via
-  // buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop.
+  // Same data the Call Stack shows for its first frame with locals, surfaced in the Variables pane so locals
+  // sit alongside Global Variables and get the pin / right-click "Add to Watch" affordances. Refreshed every
+  // pause via buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop. When that
+  // frame is not frame 0 (a Pause lands in an OS call), the header says which frame the locals belong to.
   let lastLocals=null, lastLocalsProc='';
-  function buildLocals(proc, items){ lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
-  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[]); applyVarFilter(); }
+  // The header names the procedure only. What it mirrors is the STOPPED frame, which after a Pause sits below the
+  // runtime frames the event loop idles in; by the Owner's rule (2026-09-24) that first Clarion frame IS frame 0,
+  // so no frame number is shown for it, exactly as a watch read there carries none (49538b78 wave 5 run 2).
+  function buildLocals(proc, items){
+    lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
+  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[], true); applyVarFilter(); }
 
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
   function renderVarTree(){
@@ -1545,6 +1946,7 @@
     const name = s.name;
     const row=document.createElement('div'); row.className='row'+(isGroup?'':' selrow');
     row.style.paddingLeft=(14+depth*16)+'px';
+    row._addrFromWatch=true;   // "View memory" follows the watch reply's addr (applyValue), never base+rva
     row.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span>'
       +'<span class="vname'+(depth>1?' field':'')+'">'+esc(name)+'</span>'
       +'<span class="vtype">'+esc(s.typeName||(s.size!=null?'size '+s.size:''))+'</span>';
@@ -1556,6 +1958,11 @@
       row.innerHTML+='<span class="veq">=</span>'+watchWaitingHtml()+'<span class="pin">'+STAR+'</span>';
       row.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(name); };
       wireSel(row);
+    } else {
+      // A header is watched by name too, for its address alone: it has no value cell, so applyValue sets
+      // its addr and returns. `globals` carries only rva/module, and a THREADed record's address is per thread.
+      row.dataset.name=name;
+      wireMemMenu(row, {});
     }
     tree.appendChild(row);
 
@@ -1569,7 +1976,8 @@
     }
     return { el: row, setVisible(b){
       row.style.display=b?'':'none';
-      if(!isGroup){ syncRowWatch(name, b); return; }
+      syncRowWatch(name, b);
+      if(!isGroup) return;
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
       else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
     } };
@@ -1636,8 +2044,8 @@
       box.appendChild(e); return;
     }
     threadRows.forEach(t=>{
-      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols and esc() does not
-      // escape quotes, so interpolating them (especially into the title attribute) would be an injection sink.
+      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols, and building with DOM
+      // APIs keeps them out of HTML parsing entirely rather than relying on esc() for every attribute.
       const r=document.createElement('div');
       r.className='throw'+(t.tid===selTid?' sel':'')+(t.tid===stopTid?' stopped':'');
       const mark=document.createElement('span'); mark.className='thmark'; mark.textContent=(t.tid===selTid?'●':'○');
@@ -1690,6 +2098,7 @@
     const badge=$('thBadgeTop');
     if(badge) badge.textContent = other ? ('viewing '+threadName(t,selTid)+' — not the stopped thread') : '';
     renderThreadPicker();
+    renderHoverUi();             // the hover label names threads from the same rows
   }
 
   function selectThread(tid){
@@ -1702,6 +2111,10 @@
     // the switch and writes the old thread's memory in the user's own program. The engine gets the tid on
     // the write too and refuses a mismatch; this is the half that stops the write ever being sent.
     cancelActiveEdit();                         // an OPEN editor captured its address when it opened
+    // clearEditMeta, NOT clearValueMeta: the job here is to close the write path, and nothing else. The
+    // rows still legitimately show the old thread's values until the reply arrives and
+    // invalidateThreadScopedState blanks them — stripping their view-as tags now would strip the tag off
+    // rows that keep their value, and leave them tagless if the engine never answers the switch.
     document.querySelectorAll('.vval.editable').forEach(clearEditMeta);
     threadSwitching=true; renderThreadUi();
     send('selectthread', String(tid));
@@ -1787,18 +2200,19 @@
   //      and committing an edit against it would write another thread's memory
   //   4. the DATE/TIME view tag (.vas), whose own title carries the old thread's raw value
   //   5. the `values` cache — read by the hover data-tip long after the reply, including over a SOURCE
-  //      identifier where there is no row to look at, and by the tip's Copy Value action
+  //      identifier where there is no row to look at, and by the tip's Copy Value action.
+  //      A thread switch is not its only boundary: resetThreadState clears it at a resume and at a new
+  //      stop too, because those end a value's validity just as completely (ec45805f item 13).
   //   6. any OPEN Watch .wdetail panel, which keeps showing whatever it was last given
   function invalidateThreadScopedState(gen){
     values.clear();                                                                     // (5)
     document.querySelectorAll('[data-name]').forEach(row=>{
+      if(row._addrFromWatch) delete row.dataset.addr;   // another thread's instance, until the new reply
       const v=row.querySelector('.vval'); if(!v) return;
       // Rows that HAD an answer on the old thread are expecting a fresh one; rows still on "…" (a
       // collapsed tree row nobody is watching) are not, and must not be swept later as unanswered.
       if(v.textContent!=='…') v._pendGen=gen; else delete v._pendGen;
-      clearEditMeta(v);                                                                  // (3)
-      if(v._vas){ v._vas.remove(); v._vas=null; }                                        // (4)
-      delete v.dataset.raw; delete v.dataset.dtname; delete v.dataset.dtmode;
+      clearValueMeta(v);                                                                 // (3) + (4)
       v.classList.remove('unavail','noted','num'); v.classList.add('pending');           // (1)
       v.removeAttribute('title');                                                        // (2)
       v.textContent='…';
@@ -1817,6 +2231,12 @@
 
   // "…" means a reply is on its way. If the engine never answers for this thread (it exited between the
   // list and the click; the read failed with no event at all), the row must stop pretending to load.
+  //
+  // The row's cell is not the only thing showing that "…": invalidateThreadScopedState blanks every OPEN
+  // Watch .wdetail panel to "…" as well, and a panel is only ever refilled by a REPLY (applyValue). So a
+  // name that is never answered used to resolve on the row while its expanded panel sat on "…" for the
+  // rest of the session — the two halves of the same watch disagreeing, and the panel the more prominent
+  // of them. Whatever this sweep writes on the cell it must write on the panel too.
   const PENDING_SWEEP_MS=4000;
   function armPendingSweep(gen, tid){
     setTimeout(()=>{
@@ -1827,6 +2247,13 @@
         v.classList.remove('pending'); v.classList.add('unavail');
         v.textContent='(no reply)'; v.title='No reply from thread '+tid+' for this name.';
         delete v._pendGen; n++;
+        // Same selector and same open-check applyValue uses for its own two detail updates (the `i` flag
+        // because the panel may be keyed in a different spelling from the reply).
+        const r=v.parentElement, nm=(r&&r.dataset)?(r.dataset.name||''):'';
+        if(nm){
+          const det=document.querySelector('.wdetail[data-detail="'+cssEsc(nm)+'" i]');
+          if(det && det.style.display!=='none') det.textContent=v.textContent;
+        }
       });
       if(stackPendingTid===tid){ stackPendingTid=null; renderStack(); }
       if(n) logLine('err','thread '+tid+': '+n+' value(s) got no reply');
@@ -1843,10 +2270,116 @@
   // stop, even if the inventory request that follows fails or is overtaken; the inventory only ever adds
   // to it (the Clarion thread number, the procedure), never contradicts it.
   function resetThreadState(stoppedTid){
+    // The `values` cache is entry (5) in invalidateThreadScopedState's list, and a thread switch was the
+    // ONLY thing clearing it. A resume and a new stop end the validity of every cached value just as
+    // completely, and this function owns both — so the cache outlived the episode it belonged to
+    // (ec45805f item 13). Cleared here for the same reason the engine drops its .cwtls cache at the same
+    // boundary.
+    //
+    // It matters because not every reader of this cache is a visible cell that a new reply would repaint.
+    // Its six readers: the hover tip's value, type and engine note; the tip's Copy Value button (which
+    // copies what the tip resolved); an expanded Watch .wdetail panel, which reads the cache when it is
+    // opened; and — the one with no row behind it at all — the tip over a SOURCE identifier, where
+    // `known.value` is the only value there has ever been. That last one presented the PREVIOUS stop's
+    // number as this stop's, for a name the engine never answered this time, with nothing on screen to
+    // contradict it.
+    values.clear();
     threadRows=[]; stopTid=null; selTid=null; threadSwitching=false; stackPendingTid=null;
     switchGen++;                 // invalidates any armed sweep
     if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
     closeThreadPicker(); renderThreadUi();
+    cancelHoverSelect();         // a hover that settled on LAST stop's world must not switch this one
+    hoverBaseline=true;          // and this stop's first answer only reports (see onHover)
+  }
+
+  // ---- identify thread by window (f6e547ce) ----
+  // The ENGINE polls the window under the mouse (about every 150 ms, message-free) and sends a `hover`
+  // event only when the answer changes: {on, paused, tid}, where an absent tid means "not over one of the
+  // debuggee's windows". It is NOT a thread-scoped reply, so it never goes through tidAccepted.
+  //
+  // While RUNNING it only reports, because there is no stop to read. While PAUSED a hover selects that
+  // thread, through the same selectThread the picker uses, which already refuses when the page is not
+  // paused and when the thread is the one already shown. A switch re-reads every panel, so a hover selects
+  // only once the pointer has SETTLED on one thread for HOVER_SETTLE_MS: every new answer cancels the
+  // pending settle. It also never starts a switch while another is in flight. selectThread has no such
+  // guard of its own, and a second switch sent over the first would leave the rows' TOCTOU state belonging
+  // to neither.
+  //
+  // ONE GUARD PER RULE. The first cut also re-checked isPaused, the selected thread, a generation counter
+  // and the toggle inside the settle, and a mutation run showed every one of them dead: selectThread and
+  // clearTimeout already held each rule. A guard no test can fail reads as protection it does not give.
+  const HOVER_SETTLE_MS=300;
+  let hoverOn=false;          // the user's toggle; it outlives stops and sessions
+  let hoverTid=null;          // the engine's last answer (null = none)
+  let hoverPaused=false;      // ...and whether the ENGINE was paused when it gave it
+  let hoverTimer=null;        // the pending settle
+  let hoverRunState='idle';   // last runstate seen, to re-arm the engine when a session starts
+  let hoverBaseline=false;    // the next paused answer is this stop's first: report it, never select from it
+
+  function setHoverMode(on){
+    hoverOn=!!on;
+    cancelHoverSelect();
+    hoverTid=null; hoverPaused=false;
+    send('hover', hoverOn ? 'on' : 'off');
+    renderHoverUi();
+  }
+  function cancelHoverSelect(){
+    if(hoverTimer!==null){ clearTimeout(hoverTimer); hoverTimer=null; }
+  }
+  // A new engine starts with hover off. Re-arm it when a session begins, not on every resume (the engine
+  // re-announces on `hover on`, so a resend per resume would be chatter for nothing).
+  function hoverOnRunState(state){
+    const prev=hoverRunState; hoverRunState=state||'idle';
+    if(hoverOn && prev==='idle' && hoverRunState!=='idle') send('hover','on');
+    if(hoverRunState==='idle'){ cancelHoverSelect(); hoverTid=null; renderHoverUi(); }
+  }
+  // `on:false` needs no branch of its own: it carries no tid, so it reads as "none", and the toggle is
+  // the page's state, not the engine's.
+  function onHover(m){
+    if(!m) return;
+    cancelHoverSelect();
+    hoverTid=(typeof m.tid==='number' && m.tid>0) ? m.tid : null;
+    hoverPaused=m.paused===true;
+    renderHoverUi();
+    // hoverPaused, not isPaused: an answer the engine gave while RUNNING can land just after the page has
+    // seen the stop, and it describes a window from before the stop. (A null tid needs no check here:
+    // selectThread refuses one.)
+    if(!hoverOn || !hoverPaused) return;
+    // A NEW STOP NEVER PULLS THE VIEW OFF THE STOPPED THREAD BY ITSELF (pipeline run 1). The engine sends
+    // exactly one fresh answer per stop, and it names whatever window the pointer happened to be resting
+    // on when the step ended. Selecting from it switched away from the stopped thread, and whether that
+    // happened depended on how long the step took. So that answer is the stop's baseline, and only a
+    // later CHANGE of the hovered thread, while paused, selects.
+    if(hoverBaseline){ hoverBaseline=false; return; }
+    const tid=hoverTid;
+    hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);
+  }
+  function hoverSettle(tid){
+    hoverTimer=null;
+    if(threadSwitching){                                                 // one switch at a time: try again
+      hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);      // once the one in flight lands
+      return;
+    }
+    // A window whose thread is not in this stop's list (the list is complete for a stop: threads cannot
+    // start while the process is frozen) would only earn a refusal toast. An EMPTY list means the
+    // inventory has not arrived yet, so the engine is left to judge.
+    if(threadRows.length && !threadRowFor(tid)) return;
+    selectThread(tid);
+  }
+  function renderHoverUi(){
+    const el=$('thHover'), txt=$('thHoverText');
+    if(el) el.classList.toggle('on', hoverOn);
+    let label='', title;
+    if(!hoverOn) title="Identify thread by window: off. Click, then point at one of your program's windows.";
+    else if(hoverTid===null){ label='—'; title='Identify thread by window: on. The mouse is not over one of your program\'s windows.'; }
+    else {
+      const nm=threadName(threadRowFor(hoverTid), hoverTid);
+      label=nm;
+      title = hoverPaused ? ('The window under the mouse belongs to '+nm+'. Rest on it to show that thread.')
+                          : ('The window under the mouse belongs to '+nm+'. Pause to read that thread.');
+    }
+    if(txt) txt.textContent=label;   // textContent: nothing here is markup
+    if(el) el.title=title;
   }
 
   (function wireThreadUi(){
@@ -1855,26 +2388,30 @@
     if(chip) chip.onclick=e=>{ e.preventDefault(); e.stopPropagation(); toggleThreadPicker(); };
     const back=$('thBack');
     if(back) back.onclick=e=>{ e.stopPropagation(); if(stopTid!=null) selectThread(stopTid); };
+    const hv=$('thHover');
+    // Same as the chip: it lives in the <summary>, where a click would collapse the section.
+    if(hv) hv.onclick=e=>{ e.preventDefault(); e.stopPropagation(); setHoverMode(!hoverOn); };
   })();
 
   // ---- call stack ----
-  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The CURRENT
-  // frame (index 0) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
+  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The first frame
+  // with locals (frame 0, or the Clarion frame under a Pause) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
   // INSIDE a frame (shared varSortAlpha). The filter matches procedure/module. The twisty toggles locals;
   // clicking the frame name jumps the editor.
   let stackQ='', lastFrames=null;
   function buildStack(frames){ lastFrames=frames||[];
     // A stack reply (or the deliberate clear that starts a switch) is the answer the panel was waiting for.
     if(lastFrames.length) stackPendingTid=null;
-    renderStack();
-    // Mirror the CURRENT frame's locals into the Variables pane. requestFrameLocals guards a missing/bad
-    // frame and calls back [] (clearing the section). Watch resolves against the top frame, so frame 0 is
-    // the right one to surface here.
-    const f0=lastFrames[0];
-    requestFrameLocals(f0, items=>buildLocals(f0?f0.proc:'', items)); }
+    // Mirror the first frame that HAS locals into the Variables pane: frame 0 after an ordinary stop, but
+    // after a Pause frame 0 is the OS call the event loop idles in (no procedure), and the Clarion frame
+    // under it is the one to show (70b58a1a). renderStack owns the "has locals" test and returns that
+    // frame's index. requestFrameLocals guards a missing frame and calls back [] (clearing the section).
+    const li=renderStack(), fl=li>=0?lastFrames[li]:null;
+    requestFrameLocals(fl, items=>buildLocals(fl?fl.proc:'', items)); }
   function applyStackFilter(){ const list=$('stackList'); if(!list) return;
     list.querySelectorAll('.frame').forEach(el=>{ const show=(!stackQ || (el._hay||'').indexOf(stackQ)>=0);
       el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }
+  // Returns the index of the first frame with locals (the one buildStack mirrors), or -1.
   function renderStack(){
     const list=$('stackList'); list.innerHTML=''; const frames=lastFrames||[]; $('stackCount').textContent=frames.length;
     if(!frames.length){
@@ -1885,18 +2422,21 @@
       list.innerHTML='<div class="empty">'+(stackPendingTid!=null
         ? 'Reading '+esc(threadName(t,stackPendingTid))+'…'
         : 'Paused frames appear here.')+'</div>';
-      return;
+      return -1;
     }
+    // A frame has locals when it has a procedure AND a frame base. The engine keys a frame's locals on its
+    // procedure symbol, so a frame without one answers "(no locals)" whatever its ebp: after a Pause that
+    // is frame 0, the OS call, which carries the thread's EBP but is no Clarion procedure.
+    const hasLocals=f=>!!(f && f.proc && f.ebp && f.ebp!=='0x0');
+    const locIdx=frames.findIndex(hasLocals);
     // Frames stay in CALL ORDER (frame 0 = current → callers); only the variables inside sort.
     frames.forEach((f,idx)=>{
-      // Locals availability hinges on having a frame base (ebp), NOT on a resolved proc name: a frame may
-      // resolve to real locals even when its symbol name is unknown, so don't hide them behind a name.
-      const canLoc = !!(f.ebp && f.ebp!=='0x0');
+      const canLoc = hasLocals(f);
       const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown')+(f.uncertain?' uncertain':'');
       el._hay=((f.proc||'')+' '+(f.module||'')).toLowerCase(); el._open=false;
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
       el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
-        +(f.uncertain?'<span class="unc" title="Gjenfunnet ved rå stack-skanning, ikke via EBP-kjeden — kan være en foreldet, allerede returnert kall-adresse.">⚠</span>':'')
+        +(f.uncertain?'<span class="unc" title="Recovered by a raw stack scan, not the EBP chain — it may be a stale return address from a call that already returned.">⚠</span>':'')
         +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
         +(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
       list.appendChild(el);
@@ -1912,33 +2452,138 @@
             b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(thread changed — expand again to re-read)</div>';
             if(box) box.style.display=open?'':'none'; return; }
           if(!items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
-          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx));
+          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx, c.name||null, true));
           if(box) box.style.display=open?'':'none'; }); }
       function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
         if(open) load(); if(box) box.style.display=open?'':'none'; }
       if(canLoc){ const ar=el.querySelector('.ar'); ar.onclick=(e)=>{ e.stopPropagation(); toggle(); }; }
       if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);   // name click jumps the editor
 
-      if(idx===0 && canLoc){ open=true; el._open=true; el.querySelector('.ar').textContent='▾'; load(); }
+      if(idx===locIdx){ open=true; el._open=true; el.querySelector('.ar').textContent='▾'; load(); }
     });
     applyStackFilter();
+    return locIdx;
   }
 
   // ---- breakpoints ----
+  // Which of three states a bplist row's path is in (frozen contract, ticket 49538b78 item 5).
+  //
+  // The host sends `pathState` on EVERY row: "ok" (path is a real file), "ambiguous" (path is null because
+  // several DIFFERENT files claim this module|line and the host refuses to choose), "unknown" (path is null
+  // because no gutter bookmark claims it at all). The two null cases need different UI and only the host can
+  // tell them apart — which is the whole reason the field exists. Before it, `path:null` said "no path" for
+  // both, so an ambiguous row rendered as an ordinary link and clicking it opened ONE of several equally
+  // plausible files with nothing saying it had guessed.
+  //
+  // Resolution, in order, and each line of it is a decision:
+  //   absent             -> "unknown". An older host that sends no pathState degrades to today's best
+  //                         effort, never to a confident wrong answer.
+  //   "ok" with no path  -> NOT ok. The host guarantees (pathState === "ok") === (path != null); if that is
+  //                         broken there is nothing to open, and nothing establishes that the basename
+  //                         fallback is safe either, so it declines exactly as "ambiguous" does. The page
+  //                         asserts the invariant rather than trusting it.
+  //   unrecognised token -> declines. It comes from a newer or a broken host, and the one thing it
+  //                         establishes is that we do not know which state this is; the basename fallback is
+  //                         precisely the action that must not be taken on a guess.
+  // Compared CASE-SENSITIVELY on purpose: these are JSON tokens, and "OK" is not "ok".
+  //
+  // BP_PATH_STATES is the WIRE contract and stays at three tokens. What this function returns is a
+  // PAGE-INTERNAL state, and it has a fourth: 'declined'.
+  //
+  // WHY THE FOURTH. Declining is right for all of these, but the REASON is not the same, and the row
+  // states its reason to the user. 'ambiguous' means the host TOLD us the key is contested - "more than
+  // one file claims this line" is then a fact about their program. The other three mean we could not
+  // trust what the host said, and saying "two files claim it" there would be a FABRICATED fact, arrived
+  // at through the UI instead of through the wire - the exact thing this round exists to stop. So they
+  // render identically and say different things.
+  //   'declined' <- the invariant is broken ("ok" with no path), an unrecognised token, or no row at all.
+  // Only the page can draw this distinction: it is "the host told me it is contested" versus "I could not
+  // trust what the host told me", and the host cannot report the second about itself.
+  const BP_PATH_STATES=['ok','ambiguous','unknown'];
+  function bpPathState(b){
+    if(!b) return 'declined';
+    const raw=b.pathState;
+    if(raw===undefined||raw===null) return 'unknown';
+    if(BP_PATH_STATES.indexOf(raw)<0) return 'declined';
+    if(raw==='ok' && !b.path) return 'declined';
+    return raw;
+  }
+  // The two states that decline the action. One predicate, so the render cannot come to treat them
+  // differently by accident - the whole point is that only the WORDING differs.
+  function bpPathDeclines(st){ return st==='ambiguous' || st==='declined'; }
+  // The key remove and properties are sent under. Both name a breakpoint as module + line and nothing
+  // else, which is the whole reason for the guard below.
+  function bpActionKey(b){ return (b && b.module ? b.module : '') + ':' + ((b && (b.requested||b.line)) || 0); }
+
+  // Which rows share that key with another row in the SAME bplist.
+  //
+  // INTERIM GUARD, and the comment says so because the decline is a placeholder for identity, not the
+  // intended end state. `bpremove` sends module:line and `bpprops` sends {module,line}; host-side,
+  // RemoveBp falls through to OnGutterBpRemoved(module,line), the service sends `bp del module:line`, and
+  // the engine's RemoveBreakpoint takes THE FIRST MATCHING breakpoint. So with two DLLs each holding a
+  // same-named .clw breakpoint at the same line - which now correctly renders as TWO SEPARATE ROWS -
+  // clicking the x on one row could delete the OTHER image's breakpoint, and Apply on one could
+  // reconfigure the other's. An authority decision made on a basename. The real fix is an owner-stable
+  // identifier carried end to end, which needs a host-assigned row token and probably engine protocol
+  // work (`bp del` is module:line today); it is filed as its own ticket.
+  //
+  // THIS IS NOT pathState, and keying on pathState would leave the hole half open while looking closed.
+  // They are different ambiguities that only partly overlap: pathState=="ambiguous" means two FILES claim
+  // this module|line in the GUTTER; this one means two ENGINE BREAKPOINTS share it. If only one of the
+  // two files happens to be bookmarked, the gutter key is not poisoned, pathState is "ok", and remove is
+  // still ambiguous at the engine.
+  // No new wire field is needed: the page has the whole list at render time, so it can see the collision
+  // itself.
+  function bpAmbiguousActionKeys(list){
+    const seen=Object.create(null), dupes=Object.create(null);
+    (list||[]).forEach(b=>{ const k=bpActionKey(b); if(seen[k]) dupes[k]=true; else seen[k]=true; });
+    return dupes;
+  }
   let bps=[];
   function buildBps(list){ bps=list||[];
     const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
     if(!bps.length){ el.innerHTML='<div class="empty">Set breakpoints in the Clarion editor gutter.</div>'; return; }
+    // Computed ONCE per list, not per row: the question is about the list, and asking it per row would
+    // be quadratic for no reason.
+    const dupeKeys=bpAmbiguousActionKeys(bps);
+    const sharedLines=bpSharedLines(bps);
     bps.forEach(b=>{
       const wrap=document.createElement('div'); wrap.className='bpitem';
       const d=document.createElement('div'); d.className='bp';
       // base row: dot + module:line link
       d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
       const lk=d.querySelector('.bplink');
-      if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
+      if(lk){
+        const pstate=bpPathState(b);
+        if(bpPathDeclines(pstate)){
+          // NO onclick at all. `send('jump', module:line)` re-enters the basename lookup that the host
+          // withheld the path to avoid, and would open an arbitrary one of the candidate files — the
+          // plausible wrong answer this whole contract exists to stop. Declining is the honest action.
+          // Title set as a PROPERTY, never interpolated into innerHTML: b.module comes from the debuggee's
+          // TSWD info and is untrusted.
+          lk.classList.add('ambig');
+          // SAME behaviour for both, DIFFERENT sentence. Claiming "more than one file claims it" when the
+          // host merely sent something unreadable would state a fact about the user's program that we do
+          // not have - see bpPathState's note on the fourth state.
+          lk.title=(pstate==='ambiguous'
+                      ? 'Cannot open: more than one file claims '+b.module+':'+b.line+'.'
+                      : 'Cannot open: the host did not say which file this is.')
+                 +' Open it from the Clarion editor gutter instead.';
+          d.appendChild(badge('ambig','⚠', lk.title));
+        } else if(pstate==='ok'){
+          lk.onclick=()=>send('openbp', b.line+'\t'+b.path);
+        } else if(b.module){
+          // "unknown": no gutter information at all, so a best effort IS the honest answer, and this is
+          // deliberately the behaviour the page has always had.
+          lk.onclick=()=>send('jump', b.module+':'+b.line);
+        }
+      }
+      // Two or more rows on one module:line are the same source line in different images (1be3b82e):
+      // name the image so the rows can be told apart. Unique rows get no label.
+      if(sharedLines[bpLineKey(b)]) d.appendChild(bpImageLabel(b));
       // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
       // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
-      // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
+      // make its safety depend on esc() at every site. Absent before symbols load: the row then
       // stays exactly as it was, rather than showing "unknown".
       const own=bpOwner(b.module, b.line);
       if(own){
@@ -1960,19 +2605,55 @@
       // gear (edit properties) + remove
       const cfg=document.createElement('span'); cfg.className='bpcfg'; cfg.title='Conditions, hit count, tracepoint'; cfg.textContent='⚙';
       const rm=document.createElement('span'); rm.className='rm'; rm.title='Remove breakpoint'; rm.textContent='✕';
-      rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
+      const ed=buildBpEditor(b, !!dupeKeys[bpActionKey(b)]);
+      if(dupeKeys[bpActionKey(b)]){
+        // DISABLED, not absent. An action that vanishes reads as a rendering bug and the user goes
+        // looking for it; a disabled one carrying its reason reads as a decision. Same principle as the
+        // ambiguous path row: decline rather than guess which breakpoint was meant.
+        const why='More than one breakpoint shares '+b.module+':'+(b.requested||b.line)
+                 +' (two images hold the same source file), so the pane cannot tell them apart and will '
+                 +'not guess which to remove or reconfigure. Use the Clarion editor gutter for now.';
+        cfg.classList.add('disabled'); cfg.title=why;
+        rm.classList.add('disabled');  rm.title=why;
+      } else {
+        rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
+        cfg.onclick=(e)=>{ e.stopPropagation(); ed.style.display = ed.style.display==='none' ? 'flex' : 'none'; };
+      }
       d.appendChild(cfg); d.appendChild(rm);
       wrap.appendChild(d);
       // lazily-built inline editor
-      const ed=buildBpEditor(b); wrap.appendChild(ed);
-      cfg.onclick=(e)=>{ e.stopPropagation(); ed.style.display = ed.style.display==='none' ? 'flex' : 'none'; };
+      wrap.appendChild(ed);
       el.appendChild(wrap);
     });
     if(curFile) renderBpDots();
   }
+  // module compared case-insensitively: the host can report one compiland's name in two spellings.
+  function bpLineKey(b){ return String(b && b.module ? b.module : '').toLowerCase() + ':' + ((b && b.line) || 0); }
+  function bpSharedLines(list){
+    const seen=Object.create(null), shared=Object.create(null);
+    (list||[]).forEach(b=>{ const k=bpLineKey(b); if(seen[k]) shared[k]=true; else seen[k]=true; });
+    return shared;
+  }
+  // File name of the row's image, split on both separators; "(pending)" while the host does not know it.
+  function bpImageName(image){
+    if(image===null || image===undefined || image==='') return '(pending)';
+    const s=String(image), base=s.split(/[\\/]/).pop();
+    return base || s;
+  }
+  function bpImageLabel(b){
+    const known=!(b.image===null || b.image===undefined || b.image==='');
+    const s=document.createElement('span'); s.className='bpimg';
+    s.textContent=bpImageName(b.image);
+    s.title=(known ? String(b.image) : '(pending)')+' - hit counts are per image; remove/edit applies to every image';
+    return s;
+  }
   function badge(cls,text,title){ const s=document.createElement('span'); s.className='badge '+cls; s.textContent=text; s.title=title; return s; }
   function hitLabel(mode,val){ return (mode==='eq'?'= ':mode==='gte'?'≥ ':mode==='mod'?'every ':'')+(val||0)+(mode==='mod'?'th':''); }
-  function buildBpEditor(b){
+  // `locked` = this row shares its module:line with another, so `bpprops` cannot name which breakpoint it
+  // means. The gear that opens this editor is already inert for such a row; the Apply handler refuses as
+  // well, so the guard does not depend on the gear being the only way in. Writer-side, which is what this
+  // codebase prefers over "the only path to it is blocked".
+  function buildBpEditor(b, locked){
     const ed=document.createElement('div'); ed.className='bpedit'; ed.style.display='none';
     ed.innerHTML=
       '<label><span>Condition</span><input type="text" class="bp-cond" placeholder="e.g. count > 10" autocomplete="off"></label>'+
@@ -1985,7 +2666,10 @@
     const cond=ed.querySelector('.bp-cond'), hm=ed.querySelector('.bp-hm'), hv=ed.querySelector('.bp-hv'), tr=ed.querySelector('.bp-trace');
     cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||'';
     ed.querySelector('.bp-cancel').onclick=(e)=>{ e.stopPropagation(); cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||''; ed.style.display='none'; };
+    if(locked){ const sv=ed.querySelector('.bp-save'); sv.disabled=true;
+      sv.title='More than one breakpoint shares this module and line, so this cannot name which one to reconfigure.'; }
     ed.querySelector('.bp-save').onclick=(e)=>{ e.stopPropagation();
+      if(locked) return;                    // see buildBpEditor's `locked` note: refuse, never guess
       const mode=hm.value, payload={ module:b.module, line:(b.requested||b.line),
         condition:cond.value.trim(), hitMode:mode, hitValue:(mode?(parseInt(hv.value,10)||0):0), trace:tr.value.trim() };
       send('bpprops', JSON.stringify(payload));
@@ -2013,12 +2697,13 @@
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
-    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
-    // so interpolating them into an HTML attribute would be an injection sink).
+    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE, and DOM APIs keep them out
+    // of HTML parsing altogether.
     listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
-      // module/line/name for the right-click "Break on entry" action (dataset assignment is injection-safe)
-      d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
+      // The host's id for this row is what the right-click "Break on entry" sends back; the host looks up
+      // the module and line itself (dataset assignment is injection-safe).
+      d.dataset.pid=p.id||''; d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
       const nm=document.createElement('span'); nm.className='procname'; nm.textContent=name;
       const fl=document.createElement('span'); fl.className='procfile'; fl.textContent=module;
       fl.title='Open '+module+' at line '+p.line;
@@ -2086,6 +2771,16 @@
   // Library State: ↻ forces a re-read; expanding the panel while paused fetches on demand.
   (function(){ const lr=$('libRefresh'); if(lr) lr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); refreshLibState(); });
     const lp=secEl('libstate'); if(lp) lp.addEventListener('toggle',()=>refreshLibState()); })();
+  // Memory: an address typed + Enter, ◀ ▶ paging by the block size, ↻, and a read on expand.
+  (function(){ const inp=$('memAddr'), sel=$('memLen');
+    if(inp) inp.addEventListener('keydown',e=>{ if(e.key!=='Enter') return; e.preventDefault();
+      const a=memParseAddr(inp.value); if(a===null){ inp.classList.add('bad'); return; } memGo(a); });
+    if(sel) sel.addEventListener('change',()=>{ memLen=Math.min(MEM_MAX, +sel.value||256); if(memAddr!==null) memGo(memAddr); });
+    const pv=$('memPrev'), nx=$('memNext');
+    if(pv) pv.addEventListener('click',()=>{ if(memAddr!==null) memGo(Math.max(0, memAddr-memLen)); });
+    if(nx) nx.addEventListener('click',()=>{ if(memAddr!==null) memGo(memAddr+memLen); });
+    const mr=$('memRefresh'); if(mr) mr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); memReread(); });
+    const mp=secEl('memory'); if(mp) mp.addEventListener('toggle',()=>refreshMem()); })();
 
   // ---- registers ----
   function buildRegs(regs){
@@ -2096,19 +2791,69 @@
   }
 
   // ---- source snippet (current location) ----
-  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
+  // Session teardown ('clear'): no stop at all, so the header goes back to its idle prompt. The only other
+  // writer of curFile/curLine is buildSource, and this one only ever CLEARS them, so the two cannot
+  // disagree about which file the page is showing.
+  // The header's idle prompt: what the markup ships with, and what a teardown must put back. One home for
+  // it, because it is written in two places — the static #srchdrText above and clearSrc below — and a
+  // reword in one of them would leave a session that has been torn down looking different from one that
+  // never started. tools/test-pad-source.js checks the markup still agrees with this.
+  const SRC_IDLE_TEXT='No source — pause to show the current location.';
+  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent=SRC_IDLE_TEXT; curFile=null; curLine=0; }
+  // The one place a LOCATION is written into the header, so the pause event and the source reply cannot
+  // say it two different ways. Named for that rather than for the element: clearSrc writes #srchdrText
+  // too, and the reviewer's judgement (ec45805f item 8), which stands, is that its idle prompt is not a
+  // location and composing it out of (file, proc, line) would be worse than the second write. So this owns
+  // the location wording and clearSrc owns the empty state, and neither is the element's only writer.
+  // `line` is optional: the gutter in the snippet below also shows it, but the snippet can be absent
+  // (paused where the pad has no source file) or its section collapsed, and this header is neither.
+  function setSrcLocation(file, proc, line){
+    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file||'?')+'</span>'
+      +(line?':<span class="ln">'+esc(String(line))+'</span>':'')
+      +(proc?' — '+esc(proc):'');
+  }
+  // The ONE writer of the listing and of curFile/curLine, which is why a stop with NO source file for it
+  // arrives here too, as an empty `lines` array: the host always posts a `source` message (see SendSource).
+  // It used to post none at all in that case, and then $('src'), curFile and curLine all kept the PREVIOUS
+  // stop's file, listing and highlight while the header above named the new location — and curFile is
+  // load-bearing, because run-to-cursor is sent as curFile+':'+line, so the stale one armed a breakpoint in
+  // a file the user was no longer stopped in.
   function buildSource(file, proc, startLine, lines, current){
-    curFile=file; curLine=current;
-    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    setSrcLocation(file, proc, current);
+    // After a thread switch the host sends the SELECTED thread's source (0955b29f) and says nothing about
+    // which thread that is, so the header says it here: the page knows both tids. Here and not in
+    // setSrcLocation, whose other caller (the 'paused' arm) runs before this stop's tids are adopted.
+    const otherThread=viewingOtherThread();
+    if(otherThread){
+      const th=document.createElement('span'); th.className='srcthread';
+      th.textContent='('+threadName(threadRowFor(selTid), selTid)+')';
+      $('srchdrText').append(' ', th);
+    }
     const src=$('src'); src.innerHTML='';
+    if(!lines || !lines.length){
+      // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source
+      // right-click, the breakpoint dots) reads null and does nothing, rather than acting on the last stop.
+      curFile=null; curLine=0;
+      const none=document.createElement('div'); none.className='empty';
+      none.textContent=(otherThread ? "No source for this thread's location" : 'No source for this stop')+(file?' ('+file+')':'')+'.';
+      src.appendChild(none);
+      return;
+    }
+    curFile=file; curLine=current;
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
     const names=allSyms.map(s=>s.name).filter(Boolean).sort((a,b)=>b.length-a.length);
     if(names.length){ try{ re=new RegExp('(?<![A-Za-z0-9_])('+names.map(reEsc).join('|')+')(?![A-Za-z0-9_:])','g'); }catch(e){ re=null; } }
     lines.forEach((txt,i)=>{ const ln=startLine+i; const d=document.createElement('div');
       d.className='sline'+(ln===current?' cur':''); d.dataset.line=ln;
-      let body=esc(txt);
-      if(re) body=body.replace(re,'<span class="srcid id" data-name="$1">$1</span>');
+      // Match on the RAW line and escape each piece as it is emitted. Running the regex over esc(txt)
+      // matched inside entities (a symbol named LT split `&lt;`) and wrote the match into data-name unescaped.
+      let body='';
+      if(re){ let last=0, mm; re.lastIndex=0;
+        while((mm=re.exec(txt))){ body+=esc(txt.slice(last,mm.index))
+            +'<span class="srcid id" data-name="'+esc(mm[1])+'">'+esc(mm[1])+'</span>'; last=re.lastIndex; }
+        body+=esc(txt.slice(last));
+      } else body=esc(txt);
       d.innerHTML='<span class="gut">'+ln+'</span><span>'+body+'</span>'; src.appendChild(d); });
     src.querySelectorAll('.srcid').forEach(attachTip);
     renderBpDots();
@@ -2183,9 +2928,18 @@
   function renderTA(q){
     const m=allSyms.filter(s=>s.name.toLowerCase().includes(q.toLowerCase())).slice(0,8);
     if(!q||!m.length){ ta.classList.remove('show'); return; }
-    ta.innerHTML=m.map(s=>'<div class="ta-item" data-n="'+esc(s.name)+'"><span class="tn">'+esc(s.name)+'</span><span class="tt">'+esc(s.type||'')+'</span></div>').join('');
+    // DOM APIs, not innerHTML: s.name comes from the debuggee's debug info, and the click handler reads it
+    // back from dataset, so it has to arrive there byte for byte rather than via HTML attribute parsing.
+    ta.innerHTML='';
+    m.forEach(s=>{
+      const it=document.createElement('div'); it.className='ta-item'; it.dataset.n=s.name;
+      const tn=document.createElement('span'); tn.className='tn'; tn.textContent=s.name;
+      const tt=document.createElement('span'); tt.className='tt'; tt.textContent=s.type||'';
+      it.appendChild(tn); it.appendChild(tt);
+      it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); };
+      ta.appendChild(it);
+    });
     ta.classList.add('show');
-    ta.querySelectorAll('.ta-item').forEach(it=>it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); });
   }
   inp.addEventListener('input',()=>renderTA(inp.value));
   inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&inp.value.trim()){ addWatch(inp.value.trim()); inp.value=''; ta.classList.remove('show'); } if(e.key==='Escape') ta.classList.remove('show'); });
@@ -2203,15 +2957,20 @@
     switch(m.type){
       case 'about': setAbout(m); break;
       case 'target': setTarget(m); break;
-      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
+      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); hoverOnRunState(m.state); break;
       case 'paused':
-        $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
+        // Where the stop is, in the source header — the band this used to write is gone (87c66af6).
+        // Written HERE and not only by the 'source' reply because a `source` message does not always
+        // follow: pause somewhere the pad has no source file for and this is the only statement of the
+        // location there is. The 'source' case below overwrites it with the same shape once the snippet
+        // arrives, so the two never read differently.
+        setSrcLocation(m.module, m.proc, m.line);
         // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
         // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
         // is about to push — then adopt the thread this stop is ON, when the event names it. The host
         // asks for the inventory too, which fills in the picker and the readable labels.
         resetThreadState(m.tid);
-        buildRegs(m.regs); setPaused(true); refreshLibState(); break;
+        buildRegs(m.regs); setPaused(true); refreshLibState(); memReread(); break;
       // The target really is running again — THIS is where a step or a continue snaps the view back to
       // the stopped thread, because it is the engine saying the command took effect. Doing it when the
       // command was merely sent would relabel the panels for a command the host dropped (see send()).
@@ -2219,21 +2978,26 @@
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'threads': onThreads(m); break;
       case 'threadselected': onThreadSelected(m); break;
+      case 'hover': onHover(m); break;   // NOT tidAccepted: its tid names the window's thread, not a reply's
       case 'engineerror': onEngineError(m); break;
       // Thread-scoped replies: a reply for a thread we are no longer showing is dropped before it can
       // repaint anything (tidAccepted also lets through an engine that doesn't stamp its replies).
       case 'stack': if(tidAccepted(m)) buildStack(m.frames||[]); break;
       case 'framelocals': { if(!tidAccepted(m)) break; const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'libstate': if(tidAccepted(m)) onLibState(m.reqId, m.error, m.items||[]); break;
+      case 'mem': onMem(m); break;   // not tid-gated: memory is the process's, not a thread's
       case 'moduledata': if(tidAccepted(m)) buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
+      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note, addr:m.addr, frameIdx:m.frameIdx, frameProc:m.frameProc}); break;
       case 'varset': onVarSet(m); break;
+      case 'setip': onSetIp(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
       case 'regs': if(tidAccepted(m)) buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
+      case 'procs': renderProcs(m); break;
+      case 'attachmode': setAttachMode(m.on===true); break;
       case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
     }
   }

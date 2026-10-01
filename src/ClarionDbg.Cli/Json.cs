@@ -4,7 +4,15 @@ using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
-    /// <summary>Tiny hand-rolled JSON for the engine's machine-readable event output.</summary>
+    /// <summary>Tiny hand-rolled JSON for the engine's machine-readable event output.
+    /// <para>
+    /// NOT HERE: the thread-id writers (TidIsKnown, AppendTidMember, AppendTidValuedMember, WithTid). They
+    /// live in DebugEngine.cs, in the block headed "THE RULE, stated once", and were left there on purpose
+    /// (f367a04f item 3, 2026-09-22) rather than moved beside Str/BpSet/BpDel: the thread emitters in
+    /// DebugEngine.Threads.cs and DebugEngine.ThreadScan.cs call them unqualified as DebugEngine members,
+    /// and tools/test-engine-tid-members.ps1 and tools/test-addin-json.ps1 read the rule out of
+    /// DebugEngine.cs's source by file name. Look there before adding a tid writer here.
+    /// </para></summary>
     internal static class Json
     {
         public static string Str(string s)
@@ -60,9 +68,14 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
-        /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module.</summary>
+        /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module, and for a
+        /// procedure or method with a known extent, its last source line (<c>endLine</c>, 6fa242ae). An
+        /// unknown extent OMITS the member rather than writing 0, and a procedure or method says so with
+        /// <c>"extent":"unknown"</c> instead (f1a98318); see <see cref="ProcExtents"/> for what unknown means
+        /// and why routines carry neither.</summary>
         public static string Symbols(List<ProcSymbol> syms, TswdDebugInfo dbg)
         {
+            var extents = new ProcExtents(dbg);   // indexed from dbg's WHOLE table, not the (maybe filtered) syms
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"symbols\",\"count\":").Append(syms.Count).Append(",\"symbols\":[");
             for (int i = 0; i < syms.Count; i++)
@@ -76,8 +89,13 @@ namespace ClarionDbg.Cli
                   .Append(",\"raw\":").Append(Str(s.RawName))
                   .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))
                   .Append(",\"rva\":\"0x").Append(s.EntryRva.ToString("X")).Append('"')
-                  .Append(",\"line\":").Append(line)
-                  .Append(",\"moduleIdx\":").Append(s.ModuleIdx)
+                  .Append(",\"line\":").Append(line);
+                int endLine = extents.EndLine(s);
+                if (endLine > 0) sb.Append(",\"endLine\":").Append(endLine);
+                // Said, not just omitted (f1a98318): the host must tell "this engine could not bound it" from an
+                // engine too old to send extents at all. Only a procedure or method has an extent to be unknown.
+                else if (ProcExtents.IsExtentKind(s)) sb.Append(",\"extent\":\"unknown\"");
+                sb.Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');
             }
@@ -89,7 +107,7 @@ namespace ClarionDbg.Cli
 
         public static string Loaded(uint pid, uint loadBase)
         {
-            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\"}";
+            return Loaded(pid, loadBase, false);
         }
 
         /// <summary>An image (EXE or DLL) mapped into the target. hasDebug = TSWD present (the engine
@@ -162,10 +180,30 @@ namespace ClarionDbg.Cli
             return "{\"event\":\"regs\",\"regs\":" + (regsJson ?? "null") + "}";
         }
 
+        /// <summary>The OWNING IMAGE of a breakpoint, as a full disk path, or JSON null when the
+        /// breakpoint is still pending (no image carries its compiland yet).
+        /// <para>
+        /// The .clw <c>module</c> alone is only a BASENAME, and two loaded images can each carry a
+        /// compiland of that name. The host keys breakpoint identity on it, so without an owner two
+        /// breakpoints in two DLLs collapse into one — which is the whole of task e80072f1. This is
+        /// the IMAGE path (the EXE/DLL), NOT the .clw: it is an identity token to compare, never a
+        /// file for anyone to open.
+        /// </para>
+        /// <para>
+        /// Written by ONE function for all three breakpoint echoes (bp-set, bp-list, bp-del) so a
+        /// future emitter cannot carry the owner on some of them and not others. That asymmetry is
+        /// exactly how the <c>requestedLine</c> promise came to hold on one of three paths.
+        /// </para></summary>
+        private static string OwnerPath(UserBreakpoint bp)
+        {
+            return Str(bp.Owner == null ? null : bp.Owner.Path);
+        }
+
         public static string BpSet(UserBreakpoint bp)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"bp-set\",\"module\":").Append(Str(bp.Module))
+              .Append(",\"ownerPath\":").Append(OwnerPath(bp))
               .Append(",\"requestedLine\":").Append(bp.RequestedLine)
               .Append(",\"line\":").Append(bp.Line)
               .Append(",\"rvas\":[");
@@ -192,9 +230,16 @@ namespace ClarionDbg.Cli
               .Append(",\"hitCount\":").Append(bp.HitCount);
         }
 
-        public static string BpDel(string module, int line)
+        /// <summary>The bp-del echo. Takes the breakpoint rather than a bare line so it cannot be written
+        /// without BOTH identities: several logical breakpoints can share one planted <c>line</c> (distinct
+        /// gutter lines that snapped to the same record), so <c>line</c> alone does not say WHICH one went,
+        /// and a host keying on it drops the survivors too. Mirrors what BpSet already carries.</summary>
+        public static string BpDel(UserBreakpoint bp)
         {
-            return "{\"event\":\"bp-del\",\"module\":" + Str(module) + ",\"line\":" + line + "}";
+            return "{\"event\":\"bp-del\",\"module\":" + Str(bp.Module)
+                 + ",\"ownerPath\":" + OwnerPath(bp)
+                 + ",\"requestedLine\":" + bp.RequestedLine
+                 + ",\"line\":" + bp.Line + "}";
         }
 
         /// <summary>Result of an edit-variable-value write: the address, whether it landed, the re-read
@@ -229,6 +274,7 @@ namespace ClarionDbg.Cli
             {
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"module\":").Append(Str(bps[i].Module))
+                  .Append(",\"ownerPath\":").Append(OwnerPath(bps[i]))
                   .Append(",\"line\":").Append(bps[i].Line)
                   .Append(",\"requestedLine\":").Append(bps[i].RequestedLine);
                 AppendBpProps(sb, bps[i]);
@@ -239,23 +285,47 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>len = the REQUESTED read size (host correlates replies on it); read = bytes
-        /// actually read, which is how many hex pairs follow in bytes.</summary>
-        public static string Mem(uint addr, byte[] bytes, int read, int len)
+        /// actually read, which is how many hex pairs follow in bytes. reqId, when the request carried one,
+        /// is echoed as the LAST member so the host can match the reply to its request; null omits it.</summary>
+        public static string Mem(uint addr, byte[] bytes, int read, int len, string reqId = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"mem\",\"addr\":\"0x").Append(addr.ToString("X"))
               .Append("\",\"len\":").Append(len)
               .Append(",\"read\":").Append(read).Append(",\"bytes\":\"");
             for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
-            sb.Append("\"}");
+            sb.Append('"');
+            if (reqId != null) sb.Append(",\"reqId\":").Append(Str(reqId));
+            sb.Append('}');
             return sb.ToString();
         }
 
-        /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
-        public static string Stack(List<StackFrame> frames)
+        /// <summary>A refused mem read that carried a reqId: the same event, no bytes, and the reason. A plain
+        /// error event could not say WHICH request it answers, and the page would wait on it forever.</summary>
+        public static string MemError(uint addr, int len, string reqId, string error)
+        {
+            return "{\"event\":\"mem\",\"addr\":\"0x" + addr.ToString("X") + "\",\"len\":" + len
+                 + ",\"read\":0,\"bytes\":\"\",\"error\":" + Str(error) + ",\"reqId\":" + Str(reqId) + "}";
+        }
+
+        /// <summary>An event answering a request that carried <c>reqid=N</c> (C1, wave 7) names it: "reqId" is
+        /// appended as the LAST member. With no id the event is returned unchanged, byte for byte, so a host that
+        /// sends none sees exactly what it saw before.</summary>
+        public static string WithReqId(string json, string reqId)
+        {
+            if (reqId == null || string.IsNullOrEmpty(json) || json[json.Length - 1] != '}') return json;
+            return json.Substring(0, json.Length - 1) + ",\"reqId\":" + Str(reqId) + "}";
+        }
+
+        /// <summary>The stack reply: the resolved call stack (frame 0 = current EIP); proc/module are null when
+        /// unknown. <paramref name="reqId"/>, when the request carried one, is echoed as "reqId" ahead of the
+        /// frames; with none, the member is absent.</summary>
+        public static string Stack(List<StackFrame> frames, string reqId = null)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"stack\",\"frames\":[");
+            sb.Append("{\"event\":\"stack\"");
+            if (reqId != null) sb.Append(",\"reqId\":").Append(Str(reqId));
+            sb.Append(",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];
@@ -350,6 +420,18 @@ namespace ClarionDbg.Cli
             sb.Append('}');
         }
 
+        /// <summary>A `sym` for a name several FILE records answer to (3517fd15 item 8): the not-found reply, plus
+        /// "ambiguous", the forms that resolve to one each (possibly empty, when no form can be typed). Added last,
+        /// so a reader of the not-found shape reads it unchanged.</summary>
+        public static string SymAmbiguous(string name, List<string> forms)
+        {
+            var sb = new StringBuilder(Sym(name, false, 0, 0, 0, null, 0, null));
+            sb.Length--;
+            sb.Append(",\"ambiguous\":[");
+            for (int i = 0; i < forms.Count; i++) sb.Append(i > 0 ? "," : "").Append(Str(forms[i]));
+            return sb.Append("]}").ToString();
+        }
+
         /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
         public static string Sym(string name, bool found, uint rva, uint va, byte typeCode, string typeName, uint size, string container)
         {
@@ -370,11 +452,14 @@ namespace ClarionDbg.Cli
         /// local) address the bytes were read from; templateVa is the link-time template address. <paramref
         /// name="editable"/> gates the edit-variable-value metadata (va + places): the host keys "is this cell
         /// editable" purely on the presence of "va", so a non-writable type (ref / group / unknown) emits no va
-        /// and therefore shows no edit pencil instead of erroring on commit. A miss goes through
-        /// <see cref="WatchMiss"/>.</summary>
+        /// and therefore shows no edit pencil instead of erroring on commit. <paramref name="addr"/> ("0x..."),
+        /// when given, is the address of THIS thread's own storage for the name and is what the pad's "View
+        /// memory" opens; null for a value read from the shared THREAD template (Unallocated, Template,
+        /// Straddling), so the memory view never shows the template as the thread's data. It is independent of
+        /// <paramref name="editable"/>. A miss goes through <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
                                    byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable,
-                                   string note = null)
+                                   string note = null, string addr = null, int frameIdx = -1, string frameProc = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
@@ -387,6 +472,11 @@ namespace ClarionDbg.Cli
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read);
             if (note != null) sb.Append(",\"note\":").Append(Str(note));
+            if (addr != null) sb.Append(",\"addr\":").Append(Str(addr));
+            // A local read in a CALLER's frame (bae5f46d, contract frozen 2026-09-24): which frame, flat, and only
+            // when it is not frame 0 - a current-frame local or a global carries neither.
+            if (frameIdx > 0)
+                sb.Append(",\"frameIdx\":").Append(frameIdx).Append(",\"frameProc\":").Append(Str(frameProc));
             if (editable)
                 sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
                   .Append(",\"places\":").Append(places);
@@ -416,6 +506,66 @@ namespace ClarionDbg.Cli
         public static string Error(string message)
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";
+        }
+
+        /// <summary>`procs --json` (ProcsCommand.cs): the attach picker's process list, one line. The host parses
+        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd,started}], skipped, and
+        /// with verbose a trailing skips[{pid,name,reason}].</summary>
+        public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)
+        {
+            var sb = new StringBuilder("{\"event\":\"procs\",\"procs\":[");
+            for (int i = 0; i < procs.Count; i++)
+            {
+                var p = procs[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"pid\":").Append(p.Pid)
+                  .Append(",\"name\":").Append(Str(p.Name))
+                  .Append(",\"path\":").Append(Str(p.Path))
+                  .Append(",\"tswd\":").Append(p.Tswd ? "true" : "false")
+                  .Append(",\"started\":\"").Append(p.Started.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append('"')
+                  .Append('}');
+            }
+            sb.Append("],\"skipped\":").Append(skips.Count);
+            if (verbose)
+            {
+                sb.Append(",\"skips\":[");
+                for (int i = 0; i < skips.Count; i++)
+                {
+                    var s = skips[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"pid\":").Append(s.Pid)
+                      .Append(",\"name\":").Append(Str(s.Name))
+                      .Append(",\"reason\":").Append(Str(s.Reason))
+                      .Append('}');
+                }
+                sb.Append(']');
+            }
+            return sb.Append('}').ToString();
+        }
+
+        /// <summary>`loaded` for an ATTACHED session (3f2d747f): the launch shape plus an additive
+        /// "attached":true, so a host that does not read it is unaffected.</summary>
+        public static string Loaded(uint pid, uint loadBase, bool attached)
+        {
+            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\""
+                 + (attached ? ",\"attached\":true" : "") + "}";
+        }
+
+        /// <summary>The engine let go of the target and it keeps running. drained = debug events that were
+        /// already queued and were answered before the stop; restored = breakpoint bytes put back. "error" is
+        /// present only when a restore or the stop itself failed - the app may then crash later, and the host
+        /// must say so rather than report a clean detach.</summary>
+        public static string Detached(uint pid, int drained, int restored, string error)
+        {
+            return "{\"event\":\"detached\",\"pid\":" + pid + ",\"drained\":" + drained + ",\"restored\":" + restored
+                 + (error != null ? ",\"error\":" + Str(error) : "") + "}";
+        }
+
+        /// <summary>An `attach` that could not start: the ordinary error event plus the Win32 error code
+        /// (0 when the failure is not a Win32 one, such as an image with no TSWD).</summary>
+        public static string AttachError(string message, int code)
+        {
+            return "{\"event\":\"error\",\"message\":" + Str(message) + ",\"code\":" + code + "}";
         }
     }
 }

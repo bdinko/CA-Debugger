@@ -21,20 +21,6 @@ namespace ClarionDbg.Cli
         /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
         /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
         /// expansion against the right image's TSWD.</summary>
-///        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
-///        {
-///            var rows = new List<string>();
-///            List<LocalSym> locals;
-///            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
-///                foreach (var l in locals)
-///                {
-///                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-///                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
-///                }
-///            return rows;
-///        }
-
-
 		private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp, bool suppressSelf)
 		{
 			var rows = new List<string>();
@@ -47,8 +33,11 @@ namespace ClarionDbg.Cli
 						&& l.TypeCode == 0x16)
 						continue;
 					uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+					// note:null, editable:true stated rather than defaulted. A frame local lives on the
+					// STACK, never in .cwtls, so there is no shared-template value to veto and nothing to
+					// explain — which is an answer, not an absence of one.
 					rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places,
-									  slotVa, l.FrameOff, m.Name));
+									  slotVa, l.FrameOff, m.Name, null, true));
 				}
 			return rows;
 		}
@@ -58,11 +47,12 @@ namespace ClarionDbg.Cli
 
 
         /// <summary>framelocals reqId va ebp — the locals of ONE call-stack frame (the Call-Stack-driven
-        /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE has no frame of
-        /// its own (it runs on its procedure's frame via DO), so a routine frame surfaces its enclosing
-        /// procedure's locals read at the same EBP; a METHOD's enclosing procedure is a SEPARATE stack frame,
-        /// so methods show only their own. Emits a `framelocals` event keyed by reqId. Read-only.</summary>
-		private void HandleFrameLocalsCommand(string[] parts, uint tid)
+        /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE frame surfaces its
+        /// owning procedure's locals, read at THAT procedure's frame base (see <see cref="TryRoutineOwner"/>);
+        /// a METHOD's enclosing procedure is a SEPARATE stack frame, so methods show only their own. Emits a
+        /// `framelocals` event keyed by reqId. Read-only. <paramref name="ctx"/> is the selected thread's: a
+        /// routine stopped at its entry is only ever frame 0, and its owner is found from ESP.</summary>
+		private void HandleFrameLocalsCommand(string[] parts, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx)
 		{
 			if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
 			string reqId = parts[1];
@@ -74,10 +64,11 @@ namespace ClarionDbg.Cli
 			if (m != null && m.Dbg != null && ebp != 0 && m.Dbg.ResolveSymbolVerified(va - m.LoadBase, out sym))
 			{
 				uint entry = sym.EntryRva;
+				bool readable = true;
 				if (sym.Kind == SymbolKind.Routine)
 				{
-					uint pe = EnclosingProcedureEntry(m, va - m.LoadBase);
-					if (pe != 0) entry = pe;
+					uint entrySlot = haveCtx && va == ctx.Eip && ebp == ctx.Ebp ? ctx.Esp : 0;
+					readable = TryRoutineOwner(m, va, ebp, entrySlot, out entry, out ebp);
 				}
 
 				uint queryRva = va - m.LoadBase;
@@ -85,61 +76,204 @@ namespace ClarionDbg.Cli
 				bool inGap = sym.Kind == SymbolKind.Method
 							 && nextEntry != 0
 							 && queryRva >= nextEntry;
-				Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"warn\",\"text\":\"GAP CHECK:"
-					+ " sym=" + sym.Name
-					+ " kind=" + sym.Kind
-					+ " entryRva=0x" + sym.EntryRva.ToString("X")
-					+ " nextEntry=0x" + nextEntry.ToString("X")
-					+ " queryRva=0x" + queryRva.ToString("X")
-					+ " inGap=" + inGap + "\"}");
-				rows = LocalRowsFor(m, entry, ebp, inGap);
+				if (readable) rows = LocalRowsFor(m, entry, ebp, inGap);
 			}
 			EmitThreadEvent(tid, "{\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
 				+ ",\"items\":[" + string.Join(",", rows) + "]}");
 		}
 
-        /// <summary>The entry RVA of the procedure that lexically contains <paramref name="rva"/> — the
-        /// greatest Procedure-kind symbol entry at or below it. Used to map a routine frame to its host
-        /// procedure (they share a stack frame). 0 when none precedes.</summary>
-        private static uint EnclosingProcedureEntry(LoadedModule m, uint rva)
+        private const int ROUTINE_NEST_MAX = 64;   // DO-nesting walked before giving up on a routine's owner
+
+        /// <summary>
+        /// The procedure (or method) a ROUTINE frame belongs to, and THAT frame's base — where the routine's
+        /// visible locals live. Measured on clbrws 2026-09-24 (a stop in GRP4.Series1_TakeNextValue): a routine
+        /// sets up its OWN EBP frame (REFRESHWINDOW 0x48BFC18 -> INITIALIZEWINDOW 0x48BFC2C -> BROWSEJOBSGRAPHS
+        /// 0x48BFEB8), so the procedure's locals read at the routine's EBP were garbage. The owner was ALSO
+        /// wrong: it was taken as the greatest procedure entry at or below the routine, but routines compile
+        /// BELOW their procedure, so that named the PREVIOUS procedure in the image, whose template locals
+        /// share names (LocalRequest, WindowOpened) at other offsets.
+        ///
+        /// The chain answers both. A routine is only ever DOne from its owner's body or from another of its
+        /// routines, so follow saved-EBP links while each return lands in a routine; the first return that
+        /// lands in anything else is the owner, and that link's saved EBP is the owner's frame base. Every hop
+        /// must stay in the routine's own image and +0x1C compiland, and climb. False when the walk cannot
+        /// finish: no locals rather than another procedure's.
+        ///
+        /// A routine stopped at its ENTRY (a breakpoint on the ROUTINE label, or a Step Into that lands there)
+        /// has not run its push ebp/mov ebp,esp: <paramref name="routineEbp"/> is still its DOer's, and the
+        /// return into the DOer is at ESP, which the caller passes as <paramref name="entrySlot"/> (0 when it
+        /// does not know it, which fails). Walked from EBP instead, the first return would be the OWNER's into
+        /// ITS caller, a procedure of the same compiland whose locals would then be shown under the routine.
+        /// </summary>
+        private bool TryRoutineOwner(LoadedModule m, uint routineVa, uint routineEbp, uint entrySlot,
+                                     out uint ownerEntry, out uint ownerEbp)
         {
-            uint best = 0;
-            if (m == null || m.Dbg == null || m.Dbg.Symbols == null) return 0;
-            foreach (var s in m.Dbg.Symbols)   // sorted ascending by EntryRva
-                if (s.Kind == SymbolKind.Procedure && s.EntryRva <= rva && s.EntryRva >= best)
-                    best = s.EntryRva;
-            return best;
+            ownerEntry = 0; ownerEbp = 0;
+            int line, mi; uint recRva;
+            if (m == null || m.Dbg == null || !m.Dbg.ResolveAddr(routineVa - m.LoadBase, out line, out mi, out recRva))
+                return false;
+            bool atEntry = AtProcEntry(m, routineVa);
+            if (atEntry && entrySlot == 0) return false;
+            return FindRoutineOwner(routineEbp, mi, atEntry ? entrySlot : 0, ReadStackU32, ret => ReturnSite(m, ret),
+                                    out ownerEntry, out ownerEbp);
         }
 
-        /// <summary>Resolve a named local of the CURRENTLY-EXECUTING frame (frame 0): map the paused EIP to its
-        /// procedure (a ROUTINE shares its host procedure's frame, so route to the enclosing proc), then find a
-        /// local of that name (case-insensitive) in the proc's <see cref="LocalSym"/> set and compute its live
-        /// slot at [EBP + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
-        /// synchronous one (no THR$GetInstance func-eval). Returns false when not paused-with-context, the owning
-        /// image has no debug info, or this frame declares no local of that name. Used by `watch NAME` so a
-        /// procedure-local shadows a same-named global while we are paused inside its frame.</summary>
-        private bool TryResolveLocalInCurrentFrame(ref Native.CONTEXT_X86 ctx, bool haveCtx, string name,
-            out uint slotVa, out LocalSym found, out LoadedModule owner)
+        /// <summary>What a return address lands in, for <see cref="FindRoutineOwner"/>: null outside
+        /// <paramref name="m"/> or in code with no verified symbol.</summary>
+        internal sealed class ReturnSiteInfo
+        {
+            public SymbolKind Kind;
+            public uint EntryRva;
+            public int ModuleIdx;   // the +0x1C compiland index
+        }
+
+        private ReturnSiteInfo ReturnSite(LoadedModule m, uint ret)
+        {
+            if (ModuleAt(ret) != m) return null;
+            uint rva = ret - m.LoadBase;
+            ProcSymbol rs; int line, mi; uint recRva;
+            if (!m.Dbg.ResolveSymbolVerified(rva, out rs) || !m.Dbg.ResolveAddr(rva, out line, out mi, out recRva))
+                return null;
+            return new ReturnSiteInfo { Kind = rs.Kind, EntryRva = rs.EntryRva, ModuleIdx = mi };
+        }
+
+        /// <summary>The walk behind <see cref="TryRoutineOwner"/>, static and fed through delegates so
+        /// `protocolcheck` can drive it over synthetic stacks. <paramref name="entrySlot"/> is non-zero only for
+        /// a routine at its entry: the slot holding its return into the DOer, whose frame base is still
+        /// <paramref name="routineEbp"/>.</summary>
+        internal static bool FindRoutineOwner(uint routineEbp, int routineMi, uint entrySlot, Func<uint, uint?> read32,
+                                              Func<uint, ReturnSiteInfo> siteOf, out uint ownerEntry, out uint ownerEbp)
+        {
+            ownerEntry = 0; ownerEbp = 0;
+            if (entrySlot != 0)
+            {
+                uint? ret0 = read32(entrySlot);
+                if (ret0 == null) return false;
+                var doer = siteOf(ret0.Value);
+                if (doer == null || doer.ModuleIdx != routineMi) return false;
+                if (doer.Kind != SymbolKind.Routine)
+                {
+                    ownerEntry = doer.EntryRva; ownerEbp = routineEbp;
+                    return true;
+                }
+                // DOne from another routine, whose own frame IS routineEbp: its owner is found from there.
+            }
+            uint cur = routineEbp;
+            for (int n = 0; n < ROUTINE_NEST_MAX; n++)
+            {
+                uint? ret = read32(cur + 4), saved = read32(cur);
+                if (ret == null || saved == null) return false;
+                var site = siteOf(ret.Value);
+                if (site == null || site.ModuleIdx != routineMi) return false;
+                if (saved.Value <= cur) return false;
+                if (site.Kind != SymbolKind.Routine)
+                {
+                    ownerEntry = site.EntryRva; ownerEbp = saved.Value;
+                    return true;
+                }
+                cur = saved.Value;
+            }
+            return false;
+        }
+
+        private int _localLookups;   // calls of TryResolveLocalOnStack, for protocolcheck (3517fd15 item 7)
+
+        /// <summary>Resolve a named local against the stack in Clarion's scope order (bae5f46d; the order is the
+        /// Owner's, 2026-09-24, see <see cref="WatchFrameFor"/>): the stopped frame's locals, then global and
+        /// module data, then caller frames innermost first. <paramref name="globalExists"/> says whether a
+        /// global has the name; the caller has already looked, and answers the name itself when this returns
+        /// false. Frames are walked once per stop (<see cref="FramesForStop"/>), and only a frame with a
+        /// procedure and a frame base can answer. A ROUTINE runs in its own EBP frame, but its visible locals
+        /// are its owning procedure's, read at the OWNER's frame base (<see cref="TryRoutineOwner"/>). The slot
+        /// is [that base + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
+        /// synchronous one (no THR$GetInstance func-eval).
+        ///
+        /// So a watch on a local of the procedure that CALLED the ABC method we are stopped in reads that
+        /// caller's value, unless a global has the name, and <paramref name="frameIdx"/>/<paramref
+        /// name="frameProc"/> say which frame it came from. A recursive or re-entered procedure answers from its
+        /// innermost activation, the one closest to the stop. Returns false when not paused-with-context, when
+        /// the global comes first, or when no frame on the stack declares the name. Used by `watch NAME` and a
+        /// watch path's head.</summary>
+        private bool TryResolveLocalOnStack(ref Native.CONTEXT_X86 ctx, bool haveCtx, IntPtr hThread, string name,
+            bool globalExists,
+            out uint slotVa, out LocalSym found, out LoadedModule owner, out int frameIdx, out string frameProc)
+        {
+            slotVa = 0; found = null; owner = null; frameIdx = -1; frameProc = null;
+            _localLookups++;   // protocolcheck: a qualified watch must never get here
+            if (!haveCtx) return false;
+            var frames = FramesForStop(ref ctx, hThread);
+            uint va = 0; LocalSym l = null; LoadedModule m = null;
+            // Only frame 0 can be a routine at its entry, whose DOer's return is at ESP.
+            uint esp = ctx.Esp;
+            int i = WatchFrameFor(frames, f => TryLocalInFrame(f, ReferenceEquals(f, frames[0]) ? esp : 0, name,
+                                                              out va, out l, out m),
+                                  globalExists);
+            if (i < 0) return false;
+            slotVa = va; found = l; owner = m; frameIdx = ReportedFrameIdx(frames, i); frameProc = frames[i].Proc;
+            return true;
+        }
+
+        /// <summary>The frame a watched name resolves in, or -1 for "not a local here" (the global, when
+        /// <paramref name="globalExists"/>, or nothing at all). Clarion's own scope order, the Owner's decision of
+        /// 2026-09-24: (1) the stopped frame's locals, which after a Pause means the first Clarion frame
+        /// (<see cref="FirstClarionFrameIndex"/>); (2) global and module data; (3) only then caller frames,
+        /// innermost first. Code in the stopped procedure reads the GLOBAL when it has no local of that name, so
+        /// a caller's same-named local must not shadow it: that showed the caller's value, and an edit wrote into
+        /// the caller's stack. Static so `protocolcheck` can drive the order without a stack.</summary>
+        internal static int WatchFrameFor(IList<StackFrame> frames, Func<StackFrame, bool> declares, bool globalExists)
+        {
+            int first = FirstClarionFrameIndex(frames);
+            if (first < 0) return -1;
+            if (declares(frames[first])) return first;
+            if (globalExists) return -1;
+            return InnermostFrameWith(frames, declares, first + 1);
+        }
+
+        /// <summary>The frameIdx a watch reports for a name resolved in frame <paramref name="i"/>: 0 for the
+        /// first Clarion frame, which IS the stopped frame (the Owner's rule, 2026-09-24: after a Pause, frame 0
+        /// is the OS call and the stopped Clarion frame sits at 1 or more), so the reply carries no frame fields
+        /// and the page shows it as the current procedure; its own stack index for any caller beyond it.</summary>
+        internal static int ReportedFrameIdx(IList<StackFrame> frames, int i)
+        {
+            return i == FirstClarionFrameIndex(frames) ? 0 : i;
+        }
+
+        /// <summary>The index of the innermost frame from <paramref name="start"/> up that can answer
+        /// (<see cref="CanReadLocals"/>) and for which <paramref name="answers"/> is true; -1 when none. A frame
+        /// that cannot read locals is never asked. Static so `protocolcheck` can drive the choice without a
+        /// stack.</summary>
+        internal static int InnermostFrameWith(IList<StackFrame> frames, Func<StackFrame, bool> answers, int start = 0)
+        {
+            for (int i = start; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (!CanReadLocals(f)) continue;
+                if (answers(f)) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>A named local of ONE stack frame, read at that frame's own base. <paramref name="entrySlot"/>
+        /// is ESP for frame 0 and 0 for every other frame (see <see cref="TryRoutineOwner"/>).</summary>
+        private bool TryLocalInFrame(StackFrame f, uint entrySlot, string name, out uint slotVa, out LocalSym found,
+                                     out LoadedModule owner)
         {
             slotVa = 0; found = null; owner = null;
-            if (!haveCtx || ctx.Ebp == 0) return false;
-            var m = ModuleAt(ctx.Eip);
+            if (f == null || f.Ebp == 0) return false;
+            var m = ModuleAt(f.Va);
             if (m == null || m.Dbg == null) return false;
             ProcSymbol sym;
-            if (!m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym)) return false;
-            uint entry = sym.EntryRva;
-            if (sym.Kind == SymbolKind.Routine)
-            {
-                uint pe = EnclosingProcedureEntry(m, ctx.Eip - m.LoadBase);
-                if (pe != 0) entry = pe;
-            }
+            if (!m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym)) return false;
+            uint entry = sym.EntryRva, ebp = f.Ebp;
+            if (sym.Kind == SymbolKind.Routine && !TryRoutineOwner(m, f.Va, f.Ebp, entrySlot, out entry, out ebp))
+                return false;
             List<LocalSym> locals;
             if (!m.Dbg.ReadLocals().TryGetValue(entry, out locals) || locals == null) return false;
             foreach (var l in locals)
                 if (string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase))
                 {
                     found = l; owner = m;
-                    slotVa = (uint)((long)ctx.Ebp + l.FrameOff);
+                    slotVa = (uint)((long)ebp + l.FrameOff);
                     return true;
                 }
             return false;
@@ -147,9 +281,13 @@ namespace ClarionDbg.Cli
 
         /// <summary>True when <paramref name="name"/> is declared as a local in SOME procedure of any loaded image
         /// (locals are cached, so this is cheap after first build). Lets a watch miss tell "out of scope right now"
-        /// (a known local of a procedure we are not currently paused in) apart from a genuinely unknown name.</summary>
+        /// (a known local of a procedure we are not currently paused in) apart from a genuinely unknown name.
+        /// A watch PATH (HEAD.MEMBER) is judged by its head: the head is the local that is or is not in
+        /// scope, and no local is ever declared with a '.' in its name.</summary>
         private bool IsKnownLocalName(string name)
         {
+            int dot = name == null ? -1 : name.IndexOf('.');
+            if (dot >= 0) name = name.Substring(0, dot);
             if (NameInAnyLocalSet(_exe, name)) return true;
             foreach (var m in _modules)
             {
@@ -179,12 +317,18 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The single composite value renderer. Three shapes:
-        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
-        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
-        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
-        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
-        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        /// <summary>The `refKind` every ref:true row carries (contract frozen by the PM, 2026-09-23): "other" when
+        /// the referent is unknown or declares no members, else "class" or "aggregate" by
+        /// <see cref="LooksLikeClassLayout"/>, the SAME predicate the watch path walker refuses class heads with.
+        /// Aggregate, not group/queue: the TSWD record cannot tell a GROUP from a QUEUE (both are tag 0x08, first
+        /// member at +0), so that split would be a guess. "other" is tested FIRST because the predicate answers
+        /// true for a layout with no members, which is not evidence of a class.</summary>
+        internal static string RefKindOf(ClarionType referent)
+        {
+            if (referent == null || referent.Members == null || referent.Members.Count == 0) return "other";
+            return LooksLikeClassLayout(referent) ? "class" : "aggregate";
+        }
+
         /// <summary>Test seam for `protocolcheck`: build a row through the REAL <see cref="NodeJson"/>, so
         /// the edit-metadata veto is asserted against the shipped builder rather than a copy of its rules.
         /// Needs no live process — whether a row carries a `va` never depends on the value read.</summary>
@@ -194,8 +338,20 @@ namespace ClarionDbg.Cli
             return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
         }
 
+        /// <summary>The single composite value renderer. Three shapes:
+        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
+        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
+        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
+        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        /// <remarks>`note` and `editable` are REQUIRED, like the two child builders this delegates to.
+        /// They were fenced there first, which left the fence one level ABOVE the thing it was fencing:
+        /// THIS is the function that actually writes `editable` into the payload, so a caller that said
+        /// nothing here still got a pencil by default. The rule is the same one and it belongs at the
+        /// writer — a default that is safe for today's callers is an unasked question with an optimistic
+        /// answer.</remarks>
         private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module,
-                                string note = null, bool editable = true)
+                                string note, bool editable)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
@@ -221,6 +377,7 @@ namespace ClarionDbg.Cli
                 else
                     sb.Append(",\"value\":").Append(Json.Str("0x" + ptr.ToString("X")))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(g)))
                       .Append(",\"module\":").Append(Json.Str(module))
                       .Append(",\"typeRef\":").Append(g.TypeRef);
             }
@@ -259,6 +416,12 @@ namespace ClarionDbg.Cli
                       .Append(",\"size\":").Append(size)
                       .Append(",\"places\":").Append(places);
             }
+            // Memory panel ("View memory"): where this row's bytes live, READ-ONLY. A separate member from `va`
+            // on purpose: `va` is the edit grant and the host keys editability on its presence, so it cannot
+            // widen to groups, arrays or vetoed rows. A by-ref group row already carries `addr` (its target,
+            // for `expand`), which is also the useful thing to dump; a null reference has nothing to show.
+            if (!(byRef && g != null) && va != 0)
+                sb.Append(",\"addr\":\"0x").Append(va.ToString("X")).Append('"');
             if (note != null) sb.Append(",\"note\":").Append(Json.Str(note));
             if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
             sb.Append('}');
@@ -271,8 +434,14 @@ namespace ClarionDbg.Cli
         /// template). Members of such a row are at template+offset and must not be editable either.</param>
         /// <param name="note">the parent's explanation, repeated on each member so a row read on its own —
         /// the tree can be scrolled anywhere — still says why it cannot be edited.</param>
+        /// <remarks>BOTH ARE REQUIRED, and that is the point. They defaulted to `true, null`, so a third
+        /// caller added later inherited edit pencils by saying nothing — which is exactly the hole
+        /// cc3ac96e closed for the expand path, left open for whoever comes next. A default that is safe
+        /// for today's callers is not a safe default; it is an unasked question with an optimistic answer.
+        /// Making them required turns "did you think about the veto?" into a compile error. Both existing
+        /// callers already passed them, so nothing changed but the fence.</remarks>
         private string GroupChildrenJson(ClarionType g, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (g == null || g.Members == null) return "";
 
@@ -350,8 +519,9 @@ namespace ClarionDbg.Cli
         /// <param name="editable">false when the PARENT row is not this thread's own; elements sit at
         /// baseVa + k*stride inside that same shared block and inherit the veto.</param>
         /// <param name="note">the parent's explanation, carried onto each element row.</param>
+        /// <remarks>Required for the same reason as GroupChildrenJson's — see the note there.</remarks>
         private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
             const int cap = 1000;
@@ -368,6 +538,7 @@ namespace ClarionDbg.Cli
                     sb.Append("{\"name\":").Append(Json.Str(idx))
                       .Append(",\"type\":\"GROUP\",\"value\":").Append(Json.Str("{…}"))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(eva.ToString("X")).Append('"')
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(elem)))
                       .Append(",\"module\":").Append(Json.Str(module))
                       .Append(",\"typeRef\":").Append(elem.TypeRef);
                     // Carries no `va`, so it is not editable regardless — but it should still say why it is
@@ -392,12 +563,12 @@ namespace ClarionDbg.Cli
         /// TSWD and render that group's members read live at the dereferenced address. Emits an `expanded`
         /// event keyed by the host's reqId. Read-only — no target code runs.
         ///
-        /// KNOWN GAP, deliberately not guessed at: the command carries only reqId/module/typeRef/addr, so the
-        /// engine cannot tell whether that address came from a row whose edit pencil was vetoed (a shared
-        /// .cwtls template). Expanding such a row therefore still yields editable members. Closing it needs
-        /// the HOST to pass the flag it already has, which is a protocol change rather than an engine fix —
-        /// raised with the PM rather than decided here. The inline paths above, which DO know, are fixed.</summary>
-        private void HandleExpandCommand(string[] parts)
+        /// The edit veto is DERIVED here rather than carried in the command. The row the host is expanding
+        /// may be a shared .cwtls template — a ,THREAD symbol the selected thread has no instance of — and
+        /// its members sit at template+offset, so they must not offer a pencil either. Deriving it costs one
+        /// (usually cached) resolve per expand and cannot be forgotten by a caller; being TOLD would need a
+        /// protocol change and a host that never omits the flag.</summary>
+        private void HandleExpandCommand(string[] parts, uint tid)
         {
             // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
             if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr"); return; }
@@ -410,11 +581,92 @@ namespace ClarionDbg.Cli
             {
                 var t = m.Dbg.ResolveType(typeRef);
                 var g = (t != null && t.Kind == TypeKind.Group) ? t : GroupTypeOf(t);
-                if (g != null) rows.Add(GroupChildrenJson(g, addr, parts[2]));
+                if (g != null) rows.Add(ExpandChildrenJson(g, addr, parts[2], tid));
             }
             if (EmitJson)
                 Console.WriteLine("@JSON {\"event\":\"expanded\",\"reqId\":" + Json.Str(reqId)
                     + ",\"items\":[" + string.Join("", rows) + "]}");
+        }
+
+        /// <summary>Render an expanded node's members, vetoing their edit pencils when the address being
+        /// expanded is not data the selected thread may be offered a write to. Split out of
+        /// <see cref="HandleExpandCommand"/> only so `protocolcheck` can assert the derive-and-render pair
+        /// it shares; the TSWD type lookup above is the part a no-target check cannot reach.</summary>
+        private string ExpandChildrenJson(ClarionType g, uint addr, string module, uint tid)
+        {
+            string note;
+            bool editable = ExpandEditAllowed(g, addr, tid, out note);
+            return GroupChildrenJson(g, addr, module, editable, note);
+        }
+
+        /// <summary>May the members of the group at <paramref name="addr"/> carry edit metadata?
+        ///
+        /// The DECISION is <c>ThreadedWriteAllowed</c> itself — the shipped write guard, not a restatement
+        /// of its rules. The pencil's only promise is that a write will be accepted, so the two have to
+        /// answer the same question or the affordance lies again in a new place. It is asked over the
+        /// group's whole span, because one flag covers every member: if any member's byte would be refused,
+        /// none of them may be offered. A group with no known size is asked about its first byte.
+        ///
+        /// The NOTE is worded for a row rather than for a rejected write, in the same vocabulary the
+        /// moduledata path already puts on the parent — the tree can be scrolled anywhere, so a member row
+        /// read on its own still has to say why it cannot be edited.</summary>
+        private bool ExpandEditAllowed(ClarionType g, uint addr, uint tid, out string note)
+        {
+            note = null;
+            int span = (g != null && g.Size > 0 && g.Size <= int.MaxValue) ? (int)g.Size : 1;
+            // ONE classification decides BOTH the veto and its wording. This used to ask the guard whether
+            // to veto (over the whole SPAN) and then run its own point test on `addr` to decide what to
+            // SAY — so a group starting below a .cwtls template and reaching into it was correctly vetoed
+            // and then labelled "another thread's data", naming the wrong refusal entirely. The address
+            // the note describes is now the guard's own HitVa: the first byte that actually landed in the
+            // protected block, which for a straddling group is not where the group starts.
+            var acc = ClassifyThreadedAccess(addr, span, tid);
+            if (acc.Allowed) return true;
+
+            // Row vocabulary, not write vocabulary: nothing has been written, so "not written: ..." would
+            // be wrong here. The template case is worth a resolve to describe precisely — "no instance at
+            // all" and "an instance exists, but this is not it" read differently to someone looking at a
+            // greyed-out value and wondering why.
+            note = acc.Kind == ThreadedRefusal.SharedTemplate
+                 ? ThreadedTemplateNote(acc.Owner, acc.HitVa, tid)
+                 : "thread " + TidText(acc.OwnerTid) + "'s data — thread " + TidText(tid) + " is selected";
+            return false;
+        }
+
+        /// <summary>The row-vocabulary explanation for an address inside <paramref name="m"/>'s shared
+        /// .cwtls template, mirroring the wording HandleModuleDataCommand puts on the parent row.</summary>
+        private string ThreadedTemplateNote(LoadedModule m, uint addr, uint tid)
+        {
+            const string noInstance = "no thread instance — shared template value";
+            if (!m.HasThreadedData) return noInstance;
+            IntPtr h = OpenThreadForContext(tid);
+            if (h == IntPtr.Zero) return noInstance;
+            try
+            {
+                uint instanceVa; string reason;
+                switch (TryResolveThreadedInstance(m, addr, tid, h, out instanceVa, out reason))
+                {
+                    case ThreadedResolve.Ok:
+                        // The thread HAS a copy — this address is simply the template it was made from.
+                        return "shared " + m.Name + " template — thread " + TidText(tid) + "'s own copy is at 0x"
+                               + instanceVa.ToString("X");
+                    case ThreadedResolve.Unallocated:
+                        return "not yet used on this thread — initial value";
+                    default:
+                        return reason ?? noInstance;
+                }
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>Test seam for `protocolcheck`: derive the expand veto and render the members through the
+        /// REAL <see cref="ExpandChildrenJson"/>, so the expand path is asserted against the shipped code
+        /// rather than a copy of its rules. Read-only, and needs no live process: whether a row carries a
+        /// `va` never depends on the value read. Covers everything HandleExpandCommand does EXCEPT the TSWD
+        /// type lookup, which needs a loaded image's debug info.</summary>
+        internal string ExpandChildrenForTest(ClarionType g, uint addr, string module, uint tid)
+        {
+            return ExpandChildrenJson(g, addr, module, tid);
         }
 
         private static uint ParseHexU(string s)
@@ -469,29 +721,52 @@ namespace ClarionDbg.Cli
             t.RenderHint(out code, out size, out places);
         }
 
+        /// <summary>Does a data symbol attributed to <paramref name="dataModuleIdx"/> belong in the module-data panel of
+        /// a frame in <paramref name="frameModuleIdx"/>? Both are +0x1C line-table modules, -1 = unproven, and
+        /// unproven matches nothing, not even another unproven (52458d89).</summary>
+        internal static bool InFrameModule(int frameModuleIdx, int dataModuleIdx)
+        {
+            return frameModuleIdx >= 0 && dataModuleIdx == frameModuleIdx;
+        }
+
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
-        /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
-        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
+        /// in this module's DATA section), read live. Excludes file record buffers (FILE$PRE:RECORD) which already
+        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel, which names the
+        /// request as "reqId" when `moduledata reqid=N` asked (C1, wave 7): its rows can be edited, and the host
+        /// grants that only on a reply to a request it still holds.</summary>
         private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                              IntPtr hThread)
         {
+            string reqId, error;
+            if (!TryTakeReqId(parts, "moduledata: expected moduledata [reqid=N]", out parts, out reqId, out error)) { EmitError(error); return; }
             var rows = new List<string>();
             string module = null;
 
-            if (haveCtx)
+            // Keyed on the first Clarion frame, not on EIP: after a Pause EIP is in win32u under ClaRUN's event
+            // loop, which has no module data of its own (70b58a1a).
+            var f = haveCtx ? FirstClarionFrame(ref ctx, hThread) : null;
+            if (f != null)
             {
-                var m = ModuleAt(ctx.Eip);
+                var m = ModuleAt(f.Va);
                 ProcSymbol sym;
-                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym))
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym))
                 {
-                    int mi = sym.ModuleIdx;
-                    module = m.Dbg.ModuleNameForIdx(mi);
+                    // The label and the filter both come from the +0x1C line table at the frame (the label is
+                    // FrameAt's). A data symbol's ModuleIdx is in the same space, or -1 when no module could be
+                    // proven for it, and -1 never matches: an unproven symbol is left out, not shown in the
+                    // wrong module. Filtering by the backref slot showed another compiland's data (52458d89).
+                    int line, mi; uint recRva;
+                    if (!m.Dbg.ResolveAddr(f.Va - m.LoadBase, out line, out mi, out recRva)) mi = -1;
+                    module = f.Module;
                     var syms = m.Dbg.DataSymbols;
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
-                        if (ds.ModuleIdx != mi) continue;
-                        if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
-                            continue;   // file record buffer — belongs to the file-buffer tree, not module data
+                        if (!InFrameModule(mi, ds.ModuleIdx)) continue;
+                        // File record buffer: belongs to the file-buffer tree, not module data. The SHAPE test,
+                        // shared with the name index. A bare ":RECORD" suffix also hid a form's
+                        // HISTORY::COU:RECORD, which is a module GROUP the Tables tree does not show (04d7b4c8).
+                        if (TswdDebugInfo.IsFileRecordName(ds.Name))
+                            continue;
                         // A ,THREAD module symbol lives in .cwtls and has one instance PER THREAD, exactly
                         // like the record buffers `watch` resolves. Reading the link-time template here would
                         // show every thread the same shared value — and, now that this panel is re-read on a
@@ -499,23 +774,46 @@ namespace ClarionDbg.Cli
                         // One variable showing two values is worse than either value alone, so this mirrors
                         // the watch path: same resolution, same vocabulary, same refusal to offer an edit on
                         // a value that is not this thread's own.
+                        //
+                        // THE DETECTION IS THE SHARED ONE, over the symbol's SPAN. It used to be a point
+                        // test on ds.Rva alone, with ds.Size sitting unused six lines below: a static GROUP
+                        // beginning below CwtlsLo and extending INTO the template was not detected at all,
+                        // so the row showed the shared template value with a pencil and no explanation. The
+                        // write still bounced off the span-based guard, so it was a UI lie rather than a bad
+                        // write — but the comment above claims parity with the watch path, and a weaker test
+                        // than the path you claim parity with makes the comment the lie instead.
                         uint templateVa = m.LoadBase + ds.Rva;
                         uint va = templateVa;
                         string note = null; bool editable = true;
-                        if (m.CwtlsHi != 0 && ds.Rva >= m.CwtlsLo && ds.Rva < m.CwtlsHi)
+                        var span = ClassifyTemplateSpan(m, templateVa, ds.Size);
+                        if (span != TemplateSpan.Outside)
                         {
-                            uint instanceVa; string reason;
-                            switch (TryResolveThreadedInstance(m, templateVa, tid, hThread, out instanceVa, out reason))
+                            if (span == TemplateSpan.Straddling)
                             {
-                                case ThreadedResolve.Ok:
-                                    va = instanceVa;
-                                    break;
-                                case ThreadedResolve.Unallocated:
-                                    note = "not yet used on this thread — initial value"; editable = false;
-                                    break;
-                                default:   // Template, or a resolution we could not complete
-                                    note = reason ?? "no thread instance — shared template value"; editable = false;
-                                    break;
+                                // STRADDLING: the symbol starts OUTSIDE the threaded block and reaches into
+                                // it. It cannot be relocated — only part of it is per-thread, and
+                                // TryResolveThreadedInstance maps a whole address by its offset INSIDE the
+                                // block, which this symbol's start is not (that subtraction would underflow).
+                                // Section alignment makes this hard to produce, which is exactly why it must
+                                // be refused deliberately rather than left to arithmetic nobody checked.
+                                note = "partly in the shared " + m.Name + " template — not this thread's own data";
+                                editable = false;
+                            }
+                            else
+                            {
+                                uint instanceVa; string reason;
+                                switch (TryResolveThreadedInstance(m, templateVa, tid, hThread, out instanceVa, out reason))
+                                {
+                                    case ThreadedResolve.Ok:
+                                        va = instanceVa;
+                                        break;
+                                    case ThreadedResolve.Unallocated:
+                                        note = "not yet used on this thread — initial value"; editable = false;
+                                        break;
+                                    default:   // Template, or a resolution we could not complete
+                                        note = reason ?? "no thread instance — shared template value"; editable = false;
+                                        break;
+                                }
                             }
                         }
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
@@ -524,10 +822,18 @@ namespace ClarionDbg.Cli
                 }
             }
 
-            EmitThreadEvent(tid, "{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
-                + ",\"items\":[" + string.Join(",", rows) + "]}");
+            EmitThreadEvent(tid, Json.WithReqId("{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
+                + ",\"items\":[" + string.Join(",", rows) + "]}", reqId));
             if (!EmitJson)
-                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {tid}");
+                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {TidText(tid)}");
+        }
+
+        /// <summary>Test seam (C1, wave 7): the REAL moduledata handler for <paramref name="line"/> with no thread
+        /// context, so the reply is the empty one; protocolcheck reads what it names.</summary>
+        internal void ModuleDataForTest(string line, uint tid)
+        {
+            var ctx = default(Native.CONTEXT_X86);
+            HandleModuleDataCommand(line.Split(' '), ref ctx, false, tid, IntPtr.Zero);
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
