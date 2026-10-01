@@ -8,11 +8,19 @@
 // Runs the REAL clearEditMeta/setEditMeta/wireEdit/applyValue out of debugger.html against a minimal DOM.
 // Point it at a pre-fix copy of the page and steps 2 and 3 fail - that is the before/after proof.
 //
-//   node tools/test-pad-editmeta.js [path/to/debugger.html]
+//   node tools/test-pad-editmeta.js [path/to/debugger.html] [--allow-missing]
 // Exit code 0 = all checks passed.
 // The mini-DOM and the page-function extractor are shared with the pad's other tests (tools/pad-dom.js).
+//
+// --allow-missing stubs out any page function this file cannot find, instead of refusing to run. It exists
+// ONLY for the deliberate pre-fix run described above, where clearEditMeta genuinely does not exist yet.
+// Without it a missing target is a HARD FAILURE: silently stubbing a renamed function turns every check
+// that depends on it into a vacuous pass that still exits 0.
 const pad = require('./pad-dom');
-const html = pad.readPage(process.argv[2]);
+const argv = process.argv.slice(2);
+const ALLOW_MISSING = argv.includes('--allow-missing');
+const pagePath = argv.find(a => !a.startsWith('--'));
+const html = pad.readPage(pagePath);
 const extract = name => pad.extract(html, name);
 const El = pad.El;
 
@@ -43,7 +51,6 @@ const values = new Map();
 const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const beginEdit = () => {};
-const STAR = '*';
 // dtApply is REAL, not a stub: it inserts its own .vas tag next to the same cell and runs AFTER wireEdit,
 // so on a DATE/TIME/integer row it sits between the cell and the pencil. Stubbing it out is precisely how a
 // position-based pencil lookup passed this test while leaving a live pencil on every numeric row.
@@ -52,12 +59,27 @@ const dtModes = {};
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
 // editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
 // this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
-const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
-             'applyValue','showTipFor'].map(n => {
+const NEEDED = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
+                'clearEditMeta','clearDtMeta','clearValueMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+                'applyValue','showTipFor'];
+const missing = [];
+const src = NEEDED.map(n => {
   try { return extract(n); }
-  catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
+  catch (e) { missing.push(n); return 'function ' + n + '(){}'; }
 }).join('\n');
+if (missing.length) {
+  // A stub answers every call with `undefined`, so the checks that exercise it stop testing the page and
+  // start testing the stub — and still exit 0. Refuse to run rather than report a pass nobody can trust.
+  const what = missing.length + ' of ' + NEEDED.length + ' page function(s) not found in ' +
+               pad.resolvePage(pagePath) + ': ' + missing.join(', ');
+  if (!ALLOW_MISSING) {
+    console.log('  FAIL  ' + what);
+    console.log('        Renamed or moved? Update NEEDED in this file. Testing a pre-fix page on purpose?');
+    console.log('        Re-run with --allow-missing, which stubs them and says so.');
+    process.exit(1);
+  }
+  console.log('   (note: --allow-missing — stubbed ' + what + ')');
+}
 eval(src);
 
 // ---- scenario ----
@@ -72,7 +94,10 @@ function siblings(row){ return row.children.map(c => c.classList.toString().spli
 function state(row){
   const v = row.querySelector('.vval');
   const btn = row.querySelector('.vedit-btn');
-  return { text: v.textContent, cls: v.classList.toString(), va: v.dataset.va, pencil: !!btn, title: v.title };
+  return { text: v.textContent, cls: v.classList.toString(), va: v.dataset.va, pencil: !!btn, title: v.title,
+           // the DATE/TIME view-as family: the tag handle, and the cached raw the tag re-renders from
+           vas: !!v._vas, raw: v.dataset.raw, dtname: v.dataset.dtname, dtmode: v.dataset.dtmode,
+           vasTitle: v._vas ? v._vas.title : undefined };
 }
 const THREAD_A = { va: '0x847A76', typeCode: '0x18', size: 41, places: 0 };
 
@@ -132,12 +157,22 @@ function numericScenario(label, name, resolved, typeName, meta, rawTooltip){
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
   // the dotted 'noted' underline is meaningless without the explanation behind it
   check('note survives dtApply in the tooltip', s.title === NOTE, 'title=' + JSON.stringify(s.title));
+  // A no-va reply still CARRIES A VALUE (found:true), so the view-as tag belongs on the row — what must
+  // not survive is a raw from the PREVIOUS reply. dtApply re-derives it, so this asserts it is current,
+  // not that it is absent.
+  check('view-as tag kept on a valued reply, raw refreshed from it', s.vas && s.raw === String(resolved),
+        'raw=' + s.raw);
 
   applyValue(name, false, null, null, false, { error: ERR });
   s = state(row);
   console.log('   after a failed read:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
   check('engine reason in the tooltip', s.title === ERR, 'title=' + JSON.stringify(s.title));
+  // 77f84ca5: the miss branch used to return before dtApply, leaving the tag and its cached raw behind.
+  check('view-as tag gone — nothing left to click', !s.vas && siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
+  check('cached raw/dtname/dtmode gone', s.raw === undefined && s.dtname === undefined && s.dtmode === undefined,
+        'raw=' + s.raw + ' dtname=' + s.dtname + ' dtmode=' + s.dtmode);
 }
 numericScenario('5) LONG row (dtApply inserts .vas between the cell and the pencil)',
                 'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 }, '');
@@ -192,6 +227,142 @@ console.log('8) an OPEN Watch detail panel follows the row when the read fails')
         'detail=' + JSON.stringify(DETAIL.textContent));
   check('detail shows the unavailable state', DETAIL.textContent === '(unavailable)');
   DETAIL = null;
+}
+
+// ---- 77f84ca5: every READER of the DATE/TIME view-as state, after a reply that resolved to nothing ----
+// The cell keeps that state in two places — the .vas tag (a live element with a click handler) and
+// dataset.raw/dtname/dtmode (what the handler re-renders from). Six things read it, and a row-shaped
+// assertion only reaches some of them, so each one gets its own check here.
+console.log('9) a failed read leaves the view-as state with no reader able to resurrect the old value');
+{
+  const name = 'TIT:PUBDATE';
+  const OLD = '80000', OLD_TEXT = '2020-01-09';
+  const row = makeRow(name);
+  applyValue(name, true, OLD, 'ULONG', true, { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
+  let s = state(row);
+  check('precondition: the row really is carrying view-as state', s.vas && s.raw === OLD && s.text === OLD_TEXT,
+        JSON.stringify({ vas: s.vas, raw: s.raw, text: s.text }));
+  const tagBefore = row.querySelector('.vas');
+
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  s = state(row);
+  console.log('   ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
+
+  // reader 1 — the row's value cell, reached by CLICKING the tag (dtCycle). This is the reported symptom:
+  // the click re-rendered the cell from the stale raw and put the previous stop's value back on a row the
+  // engine had just said it could not read.
+  check('no tag left in the row to click', !row.querySelector('.vas') && siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
+  // and the handler is inert even if something still holds the old tag: dtCycle re-reads the cell, and the
+  // cell no longer has a raw to render. Drives the REAL dtCycle, through the real tag's own onclick.
+  tagBefore.onclick({ stopPropagation(){} });
+  check('clicking a detached tag cannot resurrect the value',
+        state(row).text === '(unavailable)', 'text=' + JSON.stringify(state(row).text));
+
+  // reader 2 — the tag's own title, which quoted the old thread's raw number independently of the cell
+  check('no tag title quoting the old raw', state(row).vasTitle === undefined);
+
+  // reader 3 — the edit path. beginEdit pre-fills its editor from dataset.raw; it is fenced off by
+  // dataset.va, which clearEditMeta drops, so this asserts BOTH the guard and the value behind it.
+  check('edit metadata gone, so the editor is refused', state(row).va === undefined && !state(row).pencil);
+  check('and the raw it would have pre-filled from is gone', state(row).raw === undefined, 'raw=' + state(row).raw);
+
+  // reader 4 — the cell tooltip, which dtApply owns for an ordinary value
+  check('tooltip is the engine reason, not a raw hint', state(row).title === 'THR$GetInstance returned no instance');
+
+  // reader 5 — the `values` cache, read by the hover tip and by the tip's Copy Value action. It has NO
+  // DOM row behind it on a source identifier, so no row-shaped assertion above can reach it.
+  const token = new El('span'); token.dataset.name = name;   // a source identifier: no .vval child
+  showTipFor(token);
+  console.log('   source-identifier tip: ' + JSON.stringify($('dtVal').textContent));
+  check('source tip (no row) quotes neither the raw nor the formatted old value',
+        !$('dtVal').textContent.includes(OLD) && !$('dtVal').textContent.includes(OLD_TEXT),
+        'tip=' + JSON.stringify($('dtVal').textContent));
+
+  // reader 6 — an OPEN Watch detail panel, which keeps showing whatever it was last given
+  DETAIL = new El('div'); DETAIL.classList.add('wdetail'); DETAIL.dataset.detail = name; DETAIL.style.display = '';
+  row.classList.add('watchrow');
+  applyValue(name, true, OLD, 'ULONG', true, { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  console.log('   open detail: ' + JSON.stringify(DETAIL.textContent));
+  check('open detail shows the unavailable state, not the old value', DETAIL.textContent === '(unavailable)',
+        'detail=' + JSON.stringify(DETAIL.textContent));
+  DETAIL = null;
+}
+
+// ---- 77f84ca5: one function owns clear-on-reuse, so the thread-switch path cannot drift from it ----
+// The defect was two call sites clearing different SUBSETS of the same state. Pin the shared owner
+// directly: whatever invalidateThreadScopedState and applyValue disagree about, they cannot disagree
+// about this.
+console.log('10) clearValueMeta clears BOTH families, so its two callers cannot diverge');
+{
+  const row = makeRow('JOB:JOBID');
+  applyValue('JOB:JOBID', true, '4711', 'LONG', true, { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 });
+  const v = row.querySelector('.vval');
+  check('precondition: both families present', !!v.dataset.va && !!v._vas && v.dataset.raw === '4711');
+  clearValueMeta(v);
+  check('edit family cleared', v.dataset.va === undefined && !v._vedit && !v.classList.contains('editable'));
+  check('view-as family cleared', !v._vas && v.dataset.raw === undefined && v.dataset.dtname === undefined
+        && v.dataset.dtmode === undefined);
+  check('and the tag is out of the row, not just unhooked', siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
+}
+
+// ---- ec45805f item 1: the THIRD clear site, and why it is not just a clearValueMeta call ----
+// dtApply's "this value is not a number after all" branch was clearing the view-as family INLINE - the
+// same three deletes and the same tag removal clearValueMeta does. Three copies of one clear is how
+// 77f84ca5 happened. It cannot simply call clearValueMeta, though: dtApply runs AFTER wireEdit, so that
+// would strip the edit metadata this very reply just set and silently close the write path on a cell the
+// engine said IS writable.
+//
+// Said plainly, because a test name is a claim: this case PASSES against the pre-fix page too. The
+// inline copy had the same behaviour - duplication was the defect, not a wrong answer. What it pins is
+// the constraint that shaped the fix, so the next person to "simplify" dtApply into a clearValueMeta
+// call gets a failure instead of a silently unwritable cell. Section 12 is the one that discriminates.
+console.log('11) dtApply clears the view-as half ONLY, leaving the pencil this reply just wired');
+{
+  const row = makeRow('CUS:BALANCE');
+  applyValue('CUS:BALANCE', true, '4711', 'LONG', true, { va: '0x9012A0', typeCode: '0x11', size: 4, places: 0 });
+  const v = row.querySelector('.vval');
+  check('precondition: both families present', !!v.dataset.va && !!v._vas && v.dataset.raw === '4711',
+        'va=' + v.dataset.va + ' raw=' + v.dataset.raw);
+
+  // The next stop answers the same row with something that does not parse as a number.
+  dtApply(v, 'CUS:BALANCE', '<unreadable>');
+
+  check('view-as family cleared', !v._vas && v.dataset.raw === undefined
+        && v.dataset.dtname === undefined && v.dataset.dtmode === undefined,
+        'raw=' + v.dataset.raw + ' mode=' + v.dataset.dtmode);
+  // The .vas tag goes; the pencil STAYS. Section 10's clearValueMeta case leaves 'vval' alone precisely
+  // because it takes both halves - the difference between these two sibling lists IS the decomposition.
+  check('the stale cycle tag is out of the row, so dtCycle cannot resurrect 4711',
+        !siblings(row).split(',').includes('vas'), 'siblings=[' + siblings(row) + ']');
+  check('...while the pencil stays in the row beside it',
+        siblings(row).split(',').includes('vedit-btn'), 'siblings=[' + siblings(row) + ']');
+  // THE POINT. clearValueMeta here would have wiped all four of these.
+  check('edit family UNTOUCHED: the address survives', v.dataset.va === '0x9012A0', v.dataset.va);
+  check('...and the type, size and places with it',
+        String(v.dataset.tc) === '0x11' && String(v.dataset.sz) === '4' && String(v.dataset.pl) === '0',
+        'tc=' + v.dataset.tc + ' sz=' + v.dataset.sz + ' pl=' + v.dataset.pl);
+  check('...and the cell is still marked editable', v.classList.contains('editable'), v.className);
+  check('...and the pencil is still on the cell', !!v._vedit);
+}
+
+// The three clears are ONE implementation each. A future inline copy is the defect returning, and it
+// would not fail any behavioural case above - only this.
+console.log('12) no site re-implements the view-as clear inline');
+{
+  const page = require('fs').readFileSync(require('./pad-dom').resolvePage(process.argv.slice(2).find(a => !a.startsWith('--'))), 'utf8');
+  const inline = (page.match(/delete\s+\w+\.dataset\.dtmode/g) || []).length;
+  check('dataset.dtmode is deleted in exactly one place (clearDtMeta)', inline === 1,
+        inline + ' site(s)');
+  const dt = require('./pad-dom').extract(page, 'dtApply');
+  check('dtApply delegates its null branch', /clearDtMeta\(/.test(dt) && !/delete\s+cell\.dataset\.dtmode/.test(dt),
+        dt.replace(/\s+/g, ' ').slice(0, 100));
+  const cvm = require('./pad-dom').extract(page, 'clearValueMeta');
+  check('clearValueMeta is composed of the two halves, not a third copy',
+        /clearEditMeta\(/.test(cvm) && /clearDtMeta\(/.test(cvm) && !/delete\s+cell\.dataset/.test(cvm),
+        cvm.replace(/\s+/g, ' '));
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');

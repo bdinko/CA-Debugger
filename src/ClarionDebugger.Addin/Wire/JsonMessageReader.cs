@@ -1,0 +1,409 @@
+using System;
+using System.Globalization;
+using System.Text;
+
+// A NEUTRAL namespace (6ac29815 #3): the Services layer reads engine output with this reader and checks wire
+// values with WireRules, and neither is a Terminal concern. Services used to import Terminal for these alone.
+namespace ClarionDebugger.Wire
+{
+    /// <summary>
+    /// Reads one named field out of a JSON object sent by the debugger page.
+    /// <para>
+    /// THE THREAT MODEL THIS EXISTS FOR. The debuggee is untrusted: procedure and module names come from the
+    /// target's TSWD debug info, are shown in the Procedures pane and the Source view, and come back to the
+    /// host through the WebView bridge. The extractor this replaces searched for <c>"key":</c> with
+    /// <see cref="string.IndexOf(string, StringComparison)"/> and no notion of where strings start and end,
+    /// so a value could impersonate a field simply by containing <c>"line":9</c> — and the first match won,
+    /// wherever it sat. The page worked around that by ORDERING its payloads, putting untrusted fields last,
+    /// and the old doc comment told every future payload to keep doing so. Field order is not a boundary:
+    /// it holds only while every sender remembers, and it fails silently the first time one does not.
+    /// </para>
+    /// <para>
+    /// So this walks the object properly — tracking string and escape state, and skipping nested containers
+    /// whole — and matches only members of the TOP-LEVEL object. Every inbound payload is flat (the outer
+    /// <c>{action,data}</c> envelope, and the flat object inside <c>data</c>), so nothing needs to reach into
+    /// a nested one, and "the key I found was actually inside something else" stops being expressible.
+    /// </para>
+    /// <para>
+    /// The one reader that DOES go inside is <see cref="ForEachObject"/>, and it does so on purpose: it hands
+    /// back each nested object whole, to be read with <see cref="ReadField"/> in turn, so the top-level rule
+    /// still holds for every object it is applied to. It exists for rows the host forwards but did not build
+    /// (afbc68c7).
+    /// </para>
+    /// </summary>
+    internal static class JsonMessageReader
+    {
+        /// <summary>The value of <paramref name="key"/> in the top-level object of <paramref name="json"/>,
+        /// or null when it is absent, is JSON <c>null</c>, or the text is not a well-formed object.
+        /// <para>
+        /// A string comes back unescaped; a number, <c>true</c> or <c>false</c> comes back as its literal
+        /// text, which is what the call sites hand to <c>int.TryParse</c> / <c>uint.TryParse</c>. An object
+        /// or array value reads as null: it is not a scalar, no inbound payload carries one, and returning
+        /// its raw text would let a caller expecting a string quietly use a blob of JSON as one.
+        /// </para>
+        /// <para>
+        /// MALFORMED INPUT READS AS ABSENT, on purpose. This sits on a path that must never throw — a throw
+        /// here reaches the WebView message handler and kills the command — and "absent" is a state every
+        /// caller already handles, because a field the page did not send has always been null.
+        /// </para></summary>
+        public static string ReadField(string json, string key)
+        {
+            return Find(json, key, false);
+        }
+
+        /// <summary>As <see cref="ReadField"/>, but only a JSON STRING value counts: a number, boolean,
+        /// <c>null</c>, object or array reads as null. The value comes back unescaped.
+        /// <para>
+        /// This is the engine-event reader's contract (079ff431). ClarionDebuggerService.GetStr used to match
+        /// <c>"key":"..."</c> with a regex, which also only ever answered for a string - so this keeps that -
+        /// but it returned the text between the quotes RAW. A Windows path therefore arrived with its
+        /// separators still doubled, and the host re-escaped it on the way to the page, which then showed
+        /// <c>C:\\App\\...</c>. The same regex stopped at the first quote, so a value holding an escaped
+        /// quote came back cut short.
+        /// </para></summary>
+        public static string ReadStringField(string json, string key)
+        {
+            return Find(json, key, true);
+        }
+
+        private static string Find(string json, string key, bool stringsOnly)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return null;
+
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (i >= json.Length || json[i] != '{') return null;
+            i++;
+
+            while (true)
+            {
+                SkipWhitespace(json, ref i);
+                if (i >= json.Length) return null;
+
+                char c = json[i];
+                if (c == '}') return null;          // ran out of members without finding it
+                if (c == ',') { i++; continue; }
+                if (c != '"') return null;          // a member name must be a quoted string
+
+                string name = ReadString(json, ref i);
+                if (name == null) return null;      // unterminated or illegally escaped name
+
+                SkipWhitespace(json, ref i);
+                if (i >= json.Length || json[i] != ':') return null;
+                i++;
+                SkipWhitespace(json, ref i);
+
+                // The value is walked either way. Skipping it properly is what stops the NEXT member's name
+                // being read out of the middle of this one's text.
+                bool wanted = string.Equals(name, key, StringComparison.Ordinal);
+                if (wanted && stringsOnly && (i >= json.Length || json[i] != '"')) return null;
+                string value = ReadValue(json, ref i, wanted);
+                // A "did the scan advance?" guard used to sit here — `if (i <= before && i >= json.Length)
+                // return null;` — and it could not fire. ReadValue's first statement sets i = -1 whenever i
+                // is ALREADY at or past the end, so `i >= json.Length` can hold only when the scan advanced
+                // to exactly the end, which contradicts `i <= before`. A value that genuinely does not
+                // advance (`{"a":,"b":1}`) leaves i below the end, and the ','/'}'/return-null cases at the
+                // top of this loop decide it — they also guarantee termination, which is what the guard
+                // looked like it was there for. Removed rather than kept unverified: by house rule 3 a
+                // guard no case can isolate is not a guard. See the empty-value checks in
+                // tools/test-addin-json.ps1 for the shapes that used to reach it.
+                if (i < 0) return null;             // malformed value; nothing after it can be trusted
+                if (wanted) return value;
+            }
+        }
+
+        /// <summary>Call <paramref name="visit"/> with the text of every OBJECT anywhere inside
+        /// <paramref name="json"/>, innermost first, so each one can be read with <see cref="ReadField"/>.
+        /// Returns false, having visited nothing, when the text is not one well-formed value.
+        /// <para>
+        /// This is how the host reads rows it did not build. The engine's Variables rows reach the page
+        /// verbatim - nested <c>children</c> and all - and the ones that can be edited carry the address and
+        /// type the page will later send back. The host records those tuples on the way OUT (afbc68c7), and
+        /// a flat reader cannot see a member inside a group's children. Malformed input visits NOTHING
+        /// rather than the objects before the fault: a partial walk would grant some rows of a reply the
+        /// host could not read, which is a harder state to reason about than granting none.
+        /// </para></summary>
+        public static bool ForEachObject(string json, Action<string> visit)
+        {
+            if (string.IsNullOrEmpty(json) || visit == null) return false;
+            var found = new System.Collections.Generic.List<string>();
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (!WalkValue(json, ref i, found)) return false;
+            SkipWhitespace(json, ref i);
+            if (i != json.Length) return false;     // trailing text after the value
+            foreach (var o in found) visit(o);
+            return true;
+        }
+
+        /// <summary><paramref name="json"/> re-written without every member named in <paramref name="names"/>, in
+        /// objects at ANY depth (a group's <c>children</c> included); everything else is kept, value for value, with
+        /// the insignificant whitespace dropped. Null when the text is not well-formed - there is then no telling
+        /// what a member removal would have removed.
+        /// <para>
+        /// For rows the host forwards but may not let the page edit (3517fd15): an engine row carries its edit
+        /// tuple (<c>va</c>, <c>typeCode</c>, <c>size</c>, <c>places</c>), and a row shown with it gets an edit
+        /// pencil the host would then refuse. Walked like <see cref="ForEachObject"/>, so a key-like run inside a
+        /// string value is never mistaken for a member.
+        /// </para></summary>
+        public static string WithoutMembers(string json, System.Collections.Generic.ICollection<string> names)
+        {
+            if (json == null) return null;
+            var sb = new StringBuilder(json.Length);
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (!CopyValue(json, ref i, sb, names)) return null;
+            SkipWhitespace(json, ref i);
+            return i == json.Length ? sb.ToString() : null;
+        }
+
+        /// <summary>Copy one value at <paramref name="i"/> into <paramref name="sb"/>, leaving out the named members
+        /// of every object in it. False on malformed input.
+        /// <para>ONE GRAMMAR WITH <see cref="WalkValue"/>: the same strings (ReadString), the same containers and the
+        /// same primitives (<see cref="ScanPrimitive"/>). Keep the two in step - a text one accepts and the other
+        /// refuses would be granted by one path and posted by the other.</para></summary>
+        private static bool CopyValue(string json, ref int i, StringBuilder sb, System.Collections.Generic.ICollection<string> names)
+        {
+            if (i >= json.Length) return false;
+            char c = json[i];
+            if (c == '"')
+            {
+                int s = i;
+                if (ReadString(json, ref i) == null) return false;
+                sb.Append(json, s, i - s);
+                return true;
+            }
+            if (c == '{' || c == '[')
+            {
+                bool obj = c == '{';
+                char close = obj ? '}' : ']';
+                sb.Append(c);
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == close) { i++; sb.Append(close); return true; }
+                bool wrote = false;
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    var item = new StringBuilder();
+                    bool keep = true;
+                    if (obj)
+                    {
+                        int ks = i;
+                        if (i >= json.Length || json[i] != '"') return false;
+                        string key = ReadString(json, ref i);
+                        if (key == null) return false;
+                        keep = !names.Contains(key);
+                        item.Append(json, ks, i - ks);
+                        SkipWhitespace(json, ref i);
+                        if (i >= json.Length || json[i] != ':') return false;
+                        i++;
+                        item.Append(':');
+                        SkipWhitespace(json, ref i);
+                    }
+                    if (!CopyValue(json, ref i, item, names)) return false;
+                    if (keep) { if (wrote) sb.Append(','); sb.Append(item); wrote = true; }
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != close) return false;
+                    i++;
+                    sb.Append(close);
+                    return true;
+                }
+            }
+            int st = i;
+            if (!ScanPrimitive(json, ref i)) return false;
+            sb.Append(json, st, i - st);
+            return true;
+        }
+
+        /// <summary>Walk one value at <paramref name="i"/>, collecting every object's text into
+        /// <paramref name="found"/>. False on malformed input. ONE GRAMMAR WITH <see cref="CopyValue"/>: keep them in
+        /// step.</summary>
+        private static bool WalkValue(string json, ref int i, System.Collections.Generic.List<string> found)
+        {
+            if (i >= json.Length) return false;
+            char c = json[i];
+            if (c == '"') return ReadString(json, ref i) != null;
+            if (c == '{')
+            {
+                int start = i;
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == '}') { i++; found.Add(json.Substring(start, i - start)); return true; }
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length || json[i] != '"' || ReadString(json, ref i) == null) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length || json[i] != ':') return false;
+                    i++;
+                    SkipWhitespace(json, ref i);
+                    if (!WalkValue(json, ref i, found)) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != '}') return false;
+                    i++;
+                    found.Add(json.Substring(start, i - start));
+                    return true;
+                }
+            }
+            if (c == '[')
+            {
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == ']') { i++; return true; }
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    if (!WalkValue(json, ref i, found)) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != ']') return false;
+                    i++;
+                    return true;
+                }
+            }
+            return ScanPrimitive(json, ref i);
+        }
+
+        /// <summary>Step over one primitive - <c>true</c>, <c>false</c>, <c>null</c> or a JSON number - up to the next
+        /// structural character or whitespace. False for anything else: an unquoted word, <c>01</c>, <c>1.</c>,
+        /// <c>.5</c>, <c>+1</c>, <c>0x10</c> (3517fd15, codex security run 2). It used to take any run of
+        /// characters, so a stripped row with a bad token came out as broken JSON instead of as no rows.</summary>
+        private static bool ScanPrimitive(string json, ref int i)
+        {
+            int s = i;
+            while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != ']'
+                   && json[i] != ' ' && json[i] != '\t' && json[i] != '\r' && json[i] != '\n') i++;
+            if (i == s) return false;
+            string tok = json.Substring(s, i - s);
+            return tok == "true" || tok == "false" || tok == "null" || s_jsonNumber.IsMatch(tok);
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex s_jsonNumber =
+            new System.Text.RegularExpressions.Regex(@"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?\z");
+
+        /// <summary>Consume one value. Returns its text only when <paramref name="capture"/>, so skipping a
+        /// member costs no allocation. Sets <paramref name="i"/> to -1 on malformed input.</summary>
+        private static string ReadValue(string json, ref int i, bool capture)
+        {
+            if (i >= json.Length) { i = -1; return null; }
+
+            char c = json[i];
+
+            if (c == '"')
+            {
+                string s = ReadString(json, ref i);
+                if (s == null) { i = -1; return null; }
+                return capture ? s : null;
+            }
+
+            if (c == '{' || c == '[')
+            {
+                if (!SkipContainer(json, ref i)) { i = -1; return null; }
+                return null;                        // not a scalar — see the summary
+            }
+
+            // number, true, false, null: runs to the next structural character. Safe to scan raw, because
+            // none of these can contain a quote, a comma or a brace.
+            int start = i;
+            while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != ']') i++;
+            if (!capture) return null;
+            string raw = json.Substring(start, i - start).Trim();
+            if (raw.Length == 0) return null;
+            return string.Equals(raw, "null", StringComparison.Ordinal) ? null : raw;
+        }
+
+        /// <summary>Read a quoted string starting at the opening quote, leaving <paramref name="i"/> just
+        /// past the closing one. Null if it is unterminated or carries an escape JSON does not define —
+        /// which is the whole point: this is the only function that decides where a string ENDS, so a quote
+        /// inside a value can never be mistaken for the end of it.</summary>
+        private static string ReadString(string json, ref int i)
+        {
+            i++;                                    // past the opening quote
+            var sb = new StringBuilder();
+            while (i < json.Length)
+            {
+                char c = json[i];
+
+                if (c == '"') { i++; return sb.ToString(); }
+
+                if (c == '\\')
+                {
+                    i++;
+                    if (i >= json.Length) return null;
+                    switch (json[i])
+                    {
+                        case '"':  sb.Append('"');  break;
+                        case '\\': sb.Append('\\'); break;
+                        case '/':  sb.Append('/');  break;
+                        case 'b':  sb.Append('\b'); break;
+                        case 'f':  sb.Append('\f'); break;
+                        case 'n':  sb.Append('\n'); break;
+                        case 'r':  sb.Append('\r'); break;
+                        case 't':  sb.Append('\t'); break;
+                        case 'u':
+                        {
+                            if (i + 4 >= json.Length) return null;
+                            int cp;
+                            if (!int.TryParse(json.Substring(i + 1, 4), NumberStyles.HexNumber,
+                                              CultureInfo.InvariantCulture, out cp)) return null;
+                            sb.Append((char)cp);
+                            i += 4;
+                            break;
+                        }
+                        default: return null;       // not a JSON escape; refuse rather than guess
+                    }
+                    i++;
+                    continue;
+                }
+
+                sb.Append(c);
+                i++;
+            }
+            return null;                            // unterminated
+        }
+
+        /// <summary>Step over a whole object or array, starting at its opening bracket. Strings inside it go
+        /// through <see cref="ReadString"/>, so a brace or bracket inside a string value cannot unbalance
+        /// the count — the failure the old extractor had no way to avoid.</summary>
+        private static bool SkipContainer(string json, ref int i)
+        {
+            int depth = 0;
+            while (i < json.Length)
+            {
+                char c = json[i];
+                if (c == '"')
+                {
+                    if (ReadString(json, ref i) == null) return false;
+                    continue;
+                }
+                if (c == '{' || c == '[') { depth++; i++; continue; }
+                if (c == '}' || c == ']')
+                {
+                    depth--;
+                    i++;
+                    if (depth == 0) return true;
+                    if (depth < 0) return false;
+                    continue;
+                }
+                i++;
+            }
+            return false;                           // unterminated
+        }
+
+        private static void SkipWhitespace(string json, ref int i)
+        {
+            while (i < json.Length)
+            {
+                char c = json[i];
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return;
+                i++;
+            }
+        }
+    }
+}

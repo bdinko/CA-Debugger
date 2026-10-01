@@ -13,10 +13,15 @@
 // Runs the REAL functions out of debugger.html against the shared mini-DOM (tools/pad-dom.js). Point it at
 // a pre-fix copy of the page and every thread check fails — that is the before/after proof.
 //
-//   node tools/test-pad-threads.js [path/to/debugger.html]
+//   node tools/test-pad-threads.js [path/to/debugger.html] [--allow-missing]
 // Exit code 0 = all checks passed.
+// --allow-missing stubs page functions this suite cannot find instead of refusing to run; it is only for
+// the deliberate pre-fix comparison above.
 const pad = require('./pad-dom');
-const html = pad.readPage(process.argv[2]);
+const argv = process.argv.slice(2);
+const ALLOW_MISSING = argv.includes('--allow-missing');
+const pagePath = argv.find(a => !a.startsWith('--'));
+const html = pad.readPage(pagePath);
 const El = pad.El;
 
 // ---- scope the page's functions run in -------------------------------------------------------------
@@ -52,6 +57,8 @@ let activeEdit = null;                 // the page's in-place editor handle (rea
 // The real page waits PENDING_SWEEP_MS before giving up on a row still showing "…". Shortened here so the
 // test doesn't sleep for four seconds; the assertion below keeps the page's own constant honest.
 const PENDING_SWEEP_MS = 30;
+// Same for the hover settle (the page's is 300 ms; section H asserts it is still defined and sane).
+const HOVER_SETTLE_MS = 20;
 
 // ---- collaborators that are NOT under test ---------------------------------------------------------
 const CALLS = [];
@@ -62,6 +69,7 @@ function buildRegs(r) { CALLS.push('buildRegs:' + (r ? 'regs' : 'null')); }
 function renderLibState() { CALLS.push('renderLibState'); }
 function refreshLibState() { CALLS.push('refreshLibState'); }
 function onLibState() { CALLS.push('onLibState'); }
+function memReread() { CALLS.push('memReread'); } function onMem() { CALLS.push('onMem'); }   // Memory panel: tools/test-pad-memory.js
 function renderModuleData() { }
 function applyStackFilter() { }
 function sortVars(x) { return x; }
@@ -74,22 +82,35 @@ function renderWatchList() { }   // builds rows with innerHTML; not what these c
 function saveWatches() { }       // localStorage persistence; covered by test-pad-watch-persist.js
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'send', 'resetThreadState',
+const FNS = ['esc', 'send', 'resetThreadState', 'setSrcLocation', 'clearSrc',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
-  'clearEditMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
+  'clearEditMeta', 'clearDtMeta', 'clearValueMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
   'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
   'viewingOtherThread', 'editThreadSuffix', 'watchedKey', 'addWatchSilent', 'addWatch', 'removeWatch', 'syncRowWatch',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
-  'buildStack', 'renderStack', 'onMessage'];
+  'buildStack', 'renderStack', 'onMessage',
+  'setHoverMode', 'cancelHoverSelect', 'hoverOnRunState', 'onHover', 'hoverSettle', 'renderHoverUi'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
   catch (e) { missing.push(n); return 'function ' + n + '(){}'; }
 }).join('\n');
-if (missing.length) console.log('   (note: absent from this page — pre-fix? ' + missing.join(', ') + ')');
+// A function this suite cannot find is a HARD FAILURE, not a stub: a stub returns undefined for every
+// call, so the checks that drive it pass vacuously and the run still exits 0.
+if (missing.length) {
+  const what = missing.length + ' of ' + FNS.length + ' page function(s) not found in ' +
+               pad.resolvePage(pagePath) + ': ' + missing.join(', ');
+  if (!ALLOW_MISSING) {
+    console.log('  FAIL  ' + what);
+    console.log('        Renamed or moved? Update FNS in this file. Testing a pre-fix page on purpose?');
+    console.log('        Re-run with --allow-missing, which stubs them and says so.');
+    process.exit(1);
+  }
+  console.log('   (note: --allow-missing — stubbed ' + what + ')');
+}
 eval(src);
 
 // ---- reaching into the page's in-place editor from a test ----
@@ -106,6 +127,7 @@ function commitActiveEdit(text) {
 
 // the page's own thread state (declared with `let` in the page, so the tests own the bindings here)
 let threadRows = [], stopTid = null, selTid = null, threadSwitching = false, switchGen = 0, stackPendingTid = null;
+let hoverOn = false, hoverTid = null, hoverPaused = false, hoverTimer = null, hoverRunState = 'idle', hoverBaseline = false;
 
 let failures = 0;
 function check(label, cond, detail) {
@@ -155,6 +177,8 @@ function resetAll() {
   values.clear(); clearSent(); CALLS.length = 0; TOASTS.length = 0; LOGGED.length = 0;
   threadRows = []; stopTid = null; selTid = null; threadSwitching = false; stackPendingTid = null;
   lastFrames = null; isPaused = true;
+  if (hoverTimer !== null) clearTimeout(hoverTimer);
+  hoverOn = false; hoverTid = null; hoverPaused = false; hoverTimer = null; hoverRunState = 'idle'; hoverBaseline = false;
 }
 
 (async function run() {
@@ -707,22 +731,42 @@ console.log('\n10) a row is never left on "…" when no reply can come');
 {
   resetAll();
   onThreads(THREADS_EVENT);
-  const answered = makeRow('PUB:PUB_NAME');
+  const answered = makeRow('PUB:PUB_NAME', { watch: true });
   const never = makeRow('PUB:CITY');                       // collapsed tree row: nobody is watching it
+  // An EXPANDED Watch panel is a second face of the same row, and only a REPLY ever refills it — so it is
+  // the half the sweep used to leave behind. A CLOSED one next to it proves the sweep respects the same
+  // open-check applyValue does, rather than writing into hidden panels.
+  const openDet = new El('div'); openDet.classList.add('wdetail');
+  openDet.dataset.detail = 'PUB:PUB_NAME'; openDet.style.display = '';
+  answered.parentElement.append(openDet);
+  const shutDet = new El('div'); shutDet.classList.add('wdetail');
+  shutDet.dataset.detail = 'PUB:CITY'; shutDet.style.display = 'none'; shutDet.textContent = 'stale';
+  never.parentElement.append(shutDet);
+
   applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  check('(setup) the open detail shows the value', openDet.textContent === "'Algodata'", openDet.textContent);
 
   onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
   check('(setup) both rows read "…" right after the switch',
         state(answered).text === '…' && state(never).text === '…');
+  check('(setup) and the open detail was blanked to "…" too', openDet.textContent === '…', openDet.textContent);
 
   await sleep(PENDING_SWEEP_MS + 40);
   const a = state(answered), n = state(never);
   console.log('   answered-before: ' + JSON.stringify(a) + '\n   never-answered:  ' + JSON.stringify(n));
+  console.log('   open detail: ' + JSON.stringify(openDet.textContent) +
+              '   closed detail: ' + JSON.stringify(shutDet.textContent));
   check('a row that had a value and got no reply stops pretending to load',
         a.text === '(no reply)' && a.cls.includes('unavail') && !a.cls.includes('pending'));
   check('…and says which thread did not answer', (a.title || '').includes(String(BROWSE_TID)), a.title);
   check('a row nobody asked about is left alone', n.text === '…' && n.cls.includes('pending'));
   check('the console records it', LOGGED.some(l => l.includes('got no reply')), LOGGED.join('|'));
+  // ab4b3fcf item 11: the panel used to sit on "…" for the rest of the session while its own row said
+  // "(no reply)" — the two halves of one watch disagreeing.
+  check('the OPEN detail stops pretending to load, with the row', openDet.textContent === '(no reply)',
+        'detail=' + JSON.stringify(openDet.textContent));
+  check('a CLOSED detail is not written into', shutDet.textContent === 'stale',
+        'detail=' + JSON.stringify(shutDet.textContent));
 }
 
 console.log('\n11) the sweep never fires over a newer switch, nor once the target has resumed');
@@ -820,6 +864,284 @@ console.log('\n12) replies keyed by request id are cancelled, not left hanging')
   const before = CALLS.length;
   onMessage(JSON.stringify({ type: 'framelocals', reqId: '1', items: [{ name: 'X', value: '1' }], tid: STOP_TID }));
   check('a late frame-locals reply does nothing', CALLS.length === before);
+}
+
+// ---- 87c66af6: the run-state band under the header is gone; its location detail moved to the header ----
+// The band duplicated the run-state indicator and could contradict it. What it did NOT duplicate was the
+// paused location, and a `source` reply does not always follow a pause — so these check the header now
+// carries it in both cases, rather than trusting that the source panel will.
+console.log('\n13) the paused location survives the removal of the run-state band');
+{
+  resetAll();
+  check('the band itself is gone from the page', !/locbar/.test(html));
+  check('and nothing still writes to it', html.indexOf("$('locbar')") < 0);
+
+  // paused with NO source reply behind it — the case the source panel cannot cover
+  onMessage(JSON.stringify({ type: 'paused', proc: 'BrowseCustomers', module: 'CUST.CLW', line: 412, tid: STOP_TID }));
+  const h = $('srchdrText').innerHTML;
+  console.log('   header after a bare pause: ' + JSON.stringify(h));
+  check('the header names the module', h.includes('CUST.CLW'), h);
+  check('…the line, which was the band\'s only unique detail', h.includes('412'), h);
+  check('…and the procedure', h.includes('BrowseCustomers'), h);
+
+  // and when the snippet does arrive, it must not say the location a different way
+  onMessage(JSON.stringify({ type: 'source', file: 'CUST.CLW', proc: 'BrowseCustomers',
+                             startLine: 410, lines: ['a', 'b', 'c'], current: 412 }));
+  console.log('   header after the source reply: ' + JSON.stringify($('srchdrText').innerHTML));
+  check('the source reply renders the identical header', $('srchdrText').innerHTML === h,
+        JSON.stringify($('srchdrText').innerHTML) + ' vs ' + JSON.stringify(h));
+
+  // NOT tested here: that going idle still calls clearSrc(). setRunState is a no-op stub in this suite
+  // (line 74), so a check here would be testing the stub. It is asserted in test-pad-watch-persist.js,
+  // which extracts the real one.
+}
+
+// ---- ec45805f item 13: a resume and a new stop end a cached value, same as a thread switch ----------
+// invalidateThreadScopedState cleared the `values` cache; resetThreadState did not, and it is the one
+// that runs at a resume and at every new pause. So a value cached at stop 1 stayed readable through
+// stop 2 for any name the engine did not answer again.
+//
+// Driven per READER, because the cache's readers are not all visible cells a fresh reply would repaint,
+// and the reader that actually breaks has no cell at all. Enumerated: (a) the tip's value, (b) the tip's
+// type, (c) the tip's engine note, (d) the tip's Copy Value, (e) an expanded Watch .wdetail, and (f) the
+// tip over a SOURCE identifier, where the cache is the only value that has ever existed.
+console.log('\nX) a resume and a new stop clear the values cache, for every reader of it');
+{
+  resetAll();
+  const NAME = 'CUS:STATE';
+  const row = makeRow(NAME);
+  // Stop 1 answers it, with a type and an engine caveat, so every field the tip can read is populated.
+  applyValue(NAME, true, "'CA'", 'STRING(2)', true,
+             { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0, note: 'shared template' });
+  check('precondition: stop 1 cached a value, a type and a note', values.size === 1
+        && values.get(nameKey(NAME)).value === "'CA'" && values.get(nameKey(NAME)).type === 'STRING(2)'
+        && values.get(nameKey(NAME)).note === 'shared template',
+        JSON.stringify(values.get(nameKey(NAME))));
+
+  // (f) FIRST - the reader with no row behind it. A source identifier the developer hovers.
+  const token = new El('span'); token.dataset.name = NAME; doc.body.appendChild(token);
+  showTipFor(token);
+  check('CONTROL: while stop 1 stands, the source-identifier tip shows its value',
+        $('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+
+  // The target runs on. THIS is the boundary that was not closing the cache.
+  onMessage(JSON.stringify({ type: 'resumed' }));
+  check('a resume empties the cache', values.size === 0, 'size=' + values.size);
+
+  showTipFor(token);
+  check('(f) the source-identifier tip no longer quotes stop 1\'s value',
+        !$('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+  check('(a) it offers the not-watched prompt instead of a stale number',
+        $('dtVal').textContent.includes('not watched'), $('dtVal').textContent);
+  check('(b) the type is not carried over either', $('dtType').textContent === '', $('dtType').textContent);
+  check('(c) and neither is the engine note', !$('dtVal').textContent.includes('shared template'),
+        $('dtVal').textContent);
+  // (d) Copy Value copies whatever the tip resolved, so it cannot disagree with what was just checked -
+  // named as the reader it is rather than re-asserted, because $('dtCopy') is wired by page code this
+  // suite does not extract.
+  check('(d) Copy Value copies the tip\'s own text, so it inherits (a)',
+        /copyText\(tipTarget\.val\)/.test(html) && /tipTarget=\{name,type,val\}/.test(html));
+
+  // (e) an expanded .wdetail reads the cache when it is OPENED, so it is a reader of a later moment.
+  const det = new El('div'); det.className = 'wdetail'; det.dataset.detail = NAME; det.style.display = '';
+  doc.body.appendChild(det);
+  det.textContent = values.has(nameKey(NAME)) ? values.get(nameKey(NAME)).value : '';
+  check('(e) a panel opened after the resume has no cached value to show', det.textContent === '',
+        JSON.stringify(det.textContent));
+
+  // And the same boundary at a NEW STOP, not only at a resume - resetThreadState owns both paths.
+  applyValue(NAME, true, "'CA'", 'STRING(2)', true, { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0 });
+  check('precondition: a value is cached again', values.size === 1, 'size=' + values.size);
+  onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'BrowseCustomers', line: 412,
+                             tid: STOP_TID, regs: null }));
+  check('a NEW STOP empties it too', values.size === 0, 'size=' + values.size);
+  showTipFor(token);
+  check('…so the source-identifier tip does not carry stop 1 into stop 2',
+        !$('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+
+  // ISOLATION: the clear is tied to the episode boundary, not to "the tip shows nothing any more".
+  // A value answered AFTER the new stop must be readable exactly as before.
+  applyValue(NAME, true, "'NV'", 'STRING(2)', true, { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0 });
+  showTipFor(token);
+  check('CONTROL: this stop\'s own answer is shown normally', $('dtVal').textContent.includes('NV'),
+        $('dtVal').textContent);
+  check('   and the row still carries it', state(row).text === "'NV'", state(row).text);
+}
+
+console.log('\nH) identify thread by window (f6e547ce): report while running, settle-then-select while paused');
+{
+  const OTHER_TID = 6012;   // a third thread, so a hover can target something other than the switch in flight
+  function threeThreads(sel) {
+    const e = freshThreadsEvent(sel);
+    e.threads.push({ tid: OTHER_TID, clarionThread: 3, proc: 'BrowseAuthors', module: 'clbrws012.clw', line: 88,
+                     state: 'syscall', clarionFrames: 7, stopped: false, selected: false });
+    return e;
+  }
+  const selects = () => SENT.filter(m => m.action === 'selectthread').map(m => m.data);
+  const hov = (tid, paused) => onMessage(JSON.stringify(tid == null ? { type: 'hover', on: true, paused }
+                                                                    : { type: 'hover', on: true, paused, tid }));
+  const settle = () => sleep(HOVER_SETTLE_MS + 30);
+
+  const m = html.match(/const\s+HOVER_SETTLE_MS\s*=\s*(\d+)/);
+  check('HOVER_SETTLE_MS is defined in the page, long enough to be a debounce (>= 150 ms, the poll)',
+        !!m && +m[1] >= 150, m ? m[1] : 'missing');
+
+  // H1. the toggle is what reaches the host
+  resetAll();
+  setHoverMode(true);
+  check('H1 turning it on sends hover/on', SENT.length === 1 && SENT[0].action === 'hover' && SENT[0].data === 'on',
+        JSON.stringify(SENT));
+  check('   and the toggle shows it is on', $('thHover').classList.contains('on'));
+  clearSent(); setHoverMode(false);
+  check('   turning it off sends hover/off', SENT.length === 1 && SENT[0].data === 'off', JSON.stringify(SENT));
+  check('   and the label empties', $('thHoverText').textContent === '', $('thHoverText').textContent);
+
+  // H2. running: REPORT only
+  resetAll(); hoverOn = true; isPaused = false;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, false);
+  check('H2 running: the label names the window\'s thread', $('thHoverText').textContent === 'Thread 2',
+        $('thHoverText').textContent);
+  check('   and says it cannot switch until paused', /Pause to read/.test($('thHover').title), $('thHover').title);
+  await settle();
+  check('   and never selects, however long the pointer rests', selects().length === 0, JSON.stringify(SENT));
+  // CONTROL: the same answer, paused, DOES select - so H2 is not passing because selection is broken.
+  isPaused = true; hov(BROWSE_TID, true); await settle();
+  check('   CONTROL: the same thread while paused is selected', selects().join() === String(BROWSE_TID), selects().join());
+
+  // H2b. the other race: the engine answered while RUNNING, and the answer lands after the page saw the
+  // stop. It describes a window from before the stop, so it reports and does not select.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, false); await settle();
+  check('H2b a running-time answer landing on a paused page selects nothing', selects().length === 0, selects().join());
+
+  // H3. paused: debounce. A pass over several threads selects only the one the pointer settles on.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, true);
+  check('H3 no switch the moment a hover arrives', selects().length === 0, JSON.stringify(SENT));
+  hov(OTHER_TID, true); hov(null, true); hov(BROWSE_TID, true);
+  await settle();
+  check('   one switch, to the thread it settled on, after a pass over three answers',
+        selects().join() === String(BROWSE_TID), selects().join() || 'none');
+
+  // H4. none (the IDE on top, or empty desktop) selects nothing and says so
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, true); hov(null, true);
+  await settle();
+  check('H4 moving off the program cancels the pending switch', selects().length === 0, selects().join());
+  check('   and the label shows none', $('thHoverText').textContent === '—', $('thHoverText').textContent);
+
+  // H5. the thread already shown is not re-selected (a re-read would only flicker)
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(STOP_TID, true); await settle();
+  check('H5 hovering the thread already selected sends nothing', SENT.length === 0, JSON.stringify(SENT));
+
+  // H6. the in-flight guard: no second switch over one that has not answered
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  selectThread(BROWSE_TID); clearSent();
+  check('H6 precondition: a switch is in flight', threadSwitching === true);
+  hov(OTHER_TID, true); await settle(); await settle();
+  check('   a settled hover does not start a second switch while it is', selects().length === 0, selects().join());
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  check('   precondition: the first switch has landed', threadSwitching === false && selTid === BROWSE_TID);
+  clearSent(); await settle();
+  check('   and once it lands, the hover still under the pointer is honoured',
+        selects().join() === String(OTHER_TID), selects().join() || 'none');
+
+  // H7. a resume, a new stop, or turning the mode off each cancels a pending switch
+  for (const [what, act] of [
+    ['a resume', () => onMessage(JSON.stringify({ type: 'resumed' }))],
+    ['a new stop', () => onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'Main', line: 1, tid: STOP_TID, regs: null }))],
+    ['turning it off', () => setHoverMode(false)],
+  ]) {
+    resetAll(); hoverOn = true;
+    onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true); act(); clearSent();
+    await settle();
+    check('H7 ' + what + ' before the pointer settles cancels the switch', selects().length === 0, selects().join());
+  }
+
+  // H7b. a paused:true answer that lands after the page has seen the resume (the engine polled just before
+  // it resumed) must not switch a page that is no longer paused.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); isPaused = false; clearSent();
+  hov(BROWSE_TID, true); await settle();
+  check('H7b a stale paused answer after the resume selects nothing', selects().length === 0, selects().join());
+
+  // H7c. an answer still in flight when the toggle went off is shown nowhere and selects nothing
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  setHoverMode(false); clearSent();
+  hov(BROWSE_TID, true); await settle();
+  check('H7c a late answer after turning it off selects nothing', selects().length === 0, selects().join());
+
+  // H12. a NEW STOP never pulls the view off the stopped thread by itself (pipeline run 1). The engine
+  // sends one fresh answer per stop; the page takes it as the baseline, and only a later change selects.
+  // Two step lengths, which must behave the same: SHORT (under the 150 ms poll, so no running answer came
+  // between the stops) and LONG (a running answer for the same window came first).
+  const stopEv = () => onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'Main', line: 1,
+                                                  tid: STOP_TID, regs: null }));
+  const stepThenStop = long => {
+    onMessage(JSON.stringify({ type: 'resumed' }));
+    if (long) hov(BROWSE_TID, false);
+    stopEv(); onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true);                          // the stop's one fresh answer: the pointer rests on B
+  };
+  for (const long of [false, true]) {
+    const what = long ? 'LONG step' : 'SHORT step';
+    resetAll(); hoverOn = true;
+    stopEv(); onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true);                          // stop 1's baseline
+    clearSent(); await settle();
+    check('H12 ' + what + ': the first answer at a stop does not select', selects().length === 0, selects().join());
+    stepThenStop(long); clearSent(); await settle();
+    check('   and after the ' + what + ' the next stop\'s first answer does not select either',
+          selects().length === 0 && selTid === STOP_TID, selects().join() + ' sel=' + selTid);
+    hov(OTHER_TID, true); await settle();
+    check('   a CHANGE of the hovered thread while paused does select',
+          selects().join() === String(OTHER_TID), selects().join() || 'none');
+  }
+
+  // H8. a window whose thread is not in this stop's list earns no request (and so no refusal toast)
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(99991, true); await settle();
+  check('H8 a thread missing from the list is not requested', selects().length === 0, selects().join());
+
+  // H9. the event is NOT gated by tidAccepted: its tid is rarely the selected thread, and that is the point.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  check('H9 precondition: tidAccepted WOULD drop this tid', !tidAccepted({ tid: BROWSE_TID }));
+  hov(BROWSE_TID, true);
+  check('   but the hover event still lands', hoverTid === BROWSE_TID && $('thHoverText').textContent === 'Thread 2',
+        $('thHoverText').textContent);
+
+  // H10. the engine's on:false clears the report
+  hov(BROWSE_TID, false);
+  onMessage(JSON.stringify({ type: 'hover', on: false, paused: false }));
+  check('H10 on:false from the engine clears the thread', hoverTid === null && $('thHoverText').textContent === '—',
+        $('thHoverText').textContent);
+
+  // H11. a new engine starts with hover off: re-arm it at session start, and only then
+  resetAll(); hoverOn = true; clearSent();
+  const hoverSends = () => SENT.filter(x => x.action === 'hover').length;
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('H11 a session start re-arms the engine', hoverSends() === 1, JSON.stringify(SENT));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'running' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'paused' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'running' }));
+  check('   but a resume inside the session does not resend it', hoverSends() === 1, JSON.stringify(SENT));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'idle' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('   and the next session re-arms it again', hoverSends() === 2, JSON.stringify(SENT));
+  hoverOn = false; onMessage(JSON.stringify({ type: 'runstate', state: 'idle' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('   CONTROL: with the toggle off nothing is sent', hoverSends() === 2, JSON.stringify(SENT));
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');

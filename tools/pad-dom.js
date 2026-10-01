@@ -15,7 +15,11 @@ const fs = require('fs');
 const path = require('path');
 
 const DEFAULT_PAGE = path.join(__dirname, '..', 'src', 'ClarionDebugger.Addin', 'Terminal', 'debugger.html');
-function readPage(p) { return fs.readFileSync(p || DEFAULT_PAGE, 'utf8'); }
+// One owner for "which page is this run reading". A harness that names the page in a failure message
+// needs the resolved path as well as its contents, and every suite writing `p || pad.DEFAULT_PAGE` for
+// itself is a second place the default can drift from this one.
+function resolvePage(p) { return p || DEFAULT_PAGE; }
+function readPage(p) { return fs.readFileSync(resolvePage(p), 'utf8'); }
 
 // ---- pull out a top-level `function NAME(` declaration by brace matching
 function extract(html, name) {
@@ -51,7 +55,10 @@ function parseSel(sel) {
     if (m[1]) out.classes.push(m[1]);
     else out.attrs.push({
       name: m[2],
-      value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1'),
+      // Both CSS escape forms: `\"` and the hex `\a ` the page's cssEsc uses for control characters (one
+      // optional trailing space is part of a hex escape, as in CSS).
+      value: m[3] === undefined ? null
+           : m[3].replace(/\\([0-9a-fA-F]{1,6}) ?|\\(.)/g, (_, h, c) => h ? String.fromCodePoint(parseInt(h, 16)) : c),
       ci: !!m[4],
     });
   }
@@ -83,6 +90,7 @@ class El {
   addEventListener() { }
   focus() { }      // the in-place value editor focuses and selects itself when it opens
   select() { }
+  scrollIntoView() { }   // buildSource scrolls the current source line into view after it renders
   matches(sel) {
     const p = parseSel(sel);
     if (!p.classes.every(c => this.classList.contains(c))) return false;
@@ -99,9 +107,10 @@ class El {
     return null;
   }
   querySelectorAll(sel) { const out = []; this.walk(c => { if (c.matches(sel)) out.push(c); }); return out; }
-  // Real appendChild/append, plus the single-arg `append` the older scenarios use.
+  // Real appendChild/append, plus the single-arg `append` the older scenarios use. A string passed to
+  // append becomes a text node, as in a real DOM: an El tagged '#text' whose textContent is the string.
   appendChild(c) { if (c.parentElement) c.remove(); c.parentElement = this; this.children.push(c); return c; }
-  append(...cs) { cs.forEach(c => this.appendChild(c)); }
+  append(...cs) { cs.forEach(c => this.appendChild(typeof c === 'string' ? textNode(c) : c)); }
   insertBefore(node, ref) {
     const i = ref ? this.children.indexOf(ref) : this.children.length;
     this.children.splice(i < 0 ? this.children.length : i, 0, node); node.parentElement = this; return node;
@@ -127,6 +136,8 @@ class El {
   set title(v) { if (v === undefined) delete this.attrs.title; else this.attrs.title = v; }
 }
 
+function textNode(t) { const n = new El('#text'); n.textContent = t; return n; }
+
 // A document with a real body to search, plus getElementById backed by a registry the test fills with
 // $('someId') — the page reaches most of its fixed furniture that way.
 function makeDocument() {
@@ -148,4 +159,4 @@ function makeDocument() {
   return doc;
 }
 
-module.exports = { El, ClassList, extract, extractConst, parseSel, makeDocument, readPage, DEFAULT_PAGE };
+module.exports = { El, ClassList, extract, extractConst, parseSel, makeDocument, readPage, resolvePage, DEFAULT_PAGE };

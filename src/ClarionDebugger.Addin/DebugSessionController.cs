@@ -18,8 +18,18 @@ namespace ClarionDebugger
     /// The live debugger pad's command surface. Implemented by <see cref="Terminal.ClarionDebuggerWebView"/>.
     /// Each method is the single execution path for one toolbar/web command; the WebView's own web-message
     /// handler routes through these too, so the pad and the IDE toolbar share one code path.
+    /// <para>
+    /// EVERY TARGET CARRIES ITS OWN MARSHAL (fc8d63f5): the interface extends
+    /// <see cref="System.ComponentModel.ISynchronizeInvoke"/>, and <see cref="DebugSessionController"/> posts
+    /// each command through it whenever the caller is on the wrong thread. The commands are UI-thread code,
+    /// and two of the forwarders are reached by REFLECTION from ClarionAssistant, on whatever thread it
+    /// calls from. The marshal used to apply only to a target that happened to be a WinForms Control; any
+    /// other implementation silently ran on the caller's thread, and it would have LOOKED as if it worked,
+    /// because the call was forwarded. Requiring the mechanism in the type is what makes that impossible to
+    /// forget: a Control gets it for free, and anything else does not compile until it says how.
+    /// </para>
     /// </summary>
-    public interface IDebugSessionTarget
+    public interface IDebugSessionTarget : System.ComponentModel.ISynchronizeInvoke
     {
         /// <summary>True once the hosted WebView has finished navigation and can accept commands.</summary>
         bool IsReady { get; }
@@ -40,6 +50,15 @@ namespace ClarionDebugger
         /// <summary>Run to cursor. <paramref name="spec"/> is "module:line", or null/empty for the active
         /// Monaco editor's live cursor.</summary>
         void CmdRunToCursor(string spec);
+
+        /// <summary>Break on the entry of the procedure that CONTAINS <paramref name="filePath"/>:<paramref
+        /// name="line"/> (1-based) - the Monaco editor's cursor, in practice. The caller's position is only a
+        /// lookup key: which procedure contains it, and where that procedure's entry is, are answered from the
+        /// Procedures list the pad itself issued (e61e4f92, on afbc68c7's host-owned contract), never taken
+        /// from the caller. Valid in any state: idle stages it, live arms it. Returns what happened: true when a
+        /// breakpoint was sent or staged (or already was), false when nothing was set, with
+        /// <paramref name="message"/> saying which (the Monaco toast's text on a miss).</summary>
+        bool CmdBreakOnProcEntryAt(string filePath, int line, out string message);
     }
 
     /// <summary>
@@ -137,11 +156,25 @@ namespace ClarionDebugger
         ///     re-enabling Start now that the old engine has actually died (close→reopen completion path).
         /// If the current target reports a LIVE session (a fresh pad already started its own), we leave its state
         /// alone — the old teardown completing must not stomp a new live session.
+        ///
+        /// The CALLER is checked too, which is what <paramref name="target"/> is for. "Stopped" is a claim about
+        /// the pad making it, and ClarionDebuggerService.Stop() no longer publishes Idle when it could not
+        /// confirm the engine process dead — so a caller that still reports a live session is telling us its
+        /// teardown did not finish. Publishing Idle on that word would re-enable Start against a target still
+        /// owned by the old process, which is the close→reopen→restart race this controller exists to prevent.
+        /// The cost is deliberate and one-sided: after a teardown that never confirmed, Start stays disabled
+        /// until the pad is closed and reopened (Unregister clears _target, and the next Register then reads
+        /// Idle). A disabled Start after a failed kill is a far cheaper wrong answer than an enabled one.
         /// </summary>
         public static void NotifyStopped(IDebugSessionTarget target)
         {
             lock (_gate)
             {
+                // The teardown that is reporting in must actually be over. A pad whose Stop() could not confirm
+                // the process dead still reads non-idle, and its word for "stopped" is not good enough.
+                try { if (target != null && !target.IsSessionIdle) return; }
+                catch { }   // a throwing target can't be confirmed live either way — fall through to the check below
+
                 bool currentIsIdle;
                 try { currentIsIdle = _target == null || _target.IsSessionIdle; }
                 catch { currentIsIdle = _target == null; } // a throwing target can't be confirmed live — only Idle if none
@@ -186,8 +219,91 @@ namespace ClarionDebugger
 
         /// <summary>Run to the active Monaco editor's cursor line. Entry point for ClarionAssistant's editor
         /// context menu, reached by reflection. Frozen contract: public static void RunToCursor(), a silent
-        /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.</summary>
+        /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.
+        /// It and <see cref="BreakOnProcEntry"/> are the forwarders reached from OUTSIDE this addin, so they
+        /// are the ones with no guarantee about the calling thread; <see cref="Invoke"/> marshals for this one
+        /// and every void forwarder, and BreakOnProcEntry marshals for itself (it has an answer to wait for).</summary>
         public static void RunToCursor() { Invoke(t => t.CmdRunToCursor(null), allowed: IsPaused); }
+
+        /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
+        /// name="line"/> (1-based). Entry point for ClarionAssistant's editor context menu, reached by
+        /// reflection (e61e4f92). Allowed in EVERY state, because break-on-entry means something while idle
+        /// too (the pad stages it for the next Start). The pad resolves the procedure from its own list and
+        /// still writes both outcomes to its Debug Console.
+        /// <para>
+        /// FROZEN CONTRACT (Diana, 2026-09-25, owner decision 5): ClarionAssistant shows its menu item whenever
+        /// the debugger is loaded, pad open or not, and toasts a miss, so the caller has to be TOLD. True means
+        /// a breakpoint was sent to the live engine (sent, not confirmed: the bp-set echo is async), staged for
+        /// the next Start, or already staged. False means nothing was set. Either way <paramref name="message"/>
+        /// is one line of plain text, never empty, at most <see cref="MaxMessage"/> characters, fit to show
+        /// verbatim. This method never throws. It REPLACES the void (string, int) member, which no
+        /// ClarionAssistant build ever bound; ClarionAssistant binds this one OPTIONALLY (PM decision 7), by
+        /// exact signature and a bool return, so the members it requires are untouched.
+        /// </para>
+        /// <para>
+        /// SYNCHRONOUS, unlike every other forwarder: <see cref="Invoke"/> posts with BeginInvoke and returns
+        /// before the command has run, which is fine for a void command and useless for one with an answer.
+        /// Off the pad's thread this marshals with the target's own blocking ISynchronizeInvoke.Invoke. From
+        /// ClarionAssistant's context menu the caller IS the UI thread, so in practice it runs inline.
+        /// </para></summary>
+        public static bool BreakOnProcEntry(string filePath, int line, out string message)
+        {
+            string msg = null;
+            bool ok = false;
+            try
+            {
+                IDebugSessionTarget t;
+                lock (_gate) t = _target;
+                if (t == null) { message = NoPad; return false; }
+
+                if (t.InvokeRequired)
+                {
+                    // The marshalled delegate runs the same body an on-thread caller does. It does NOT
+                    // re-enter this method, so a target whose Invoke still reports InvokeRequired cannot
+                    // recurse.
+                    t.Invoke((Action)(() => ok = BreakOnProcEntryHere(t, filePath, line, out msg)), null);
+                }
+                else ok = BreakOnProcEntryHere(t, filePath, line, out msg);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[DebugSessionController] break on entry failed: " + ex.Message);
+                ok = false;
+                msg = "Break on entry failed: " + ex.Message;
+            }
+            message = OneLine(msg, ok);
+            return ok;
+        }
+
+        /// <summary>The answer when no pad is registered; ClarionAssistant toasts it verbatim.</summary>
+        internal const string NoPad = "Open the CA Debugger pad first.";
+
+        /// <summary>The longest message <see cref="BreakOnProcEntry"/> returns (frozen contract: a toast).</summary>
+        internal const int MaxMessage = 200;
+
+        /// <summary>The on-thread half of <see cref="BreakOnProcEntry"/>. <paramref name="readBy"/> is the target
+        /// the caller read. The current one is read again here, and a pad replaced while a marshal was in
+        /// flight is refused rather than handed a position meant for its predecessor.</summary>
+        private static bool BreakOnProcEntryHere(IDebugSessionTarget readBy, string filePath, int line, out string message)
+        {
+            IDebugSessionTarget t;
+            lock (_gate) t = _target;
+            if (t == null) { message = NoPad; return false; }
+            if (!ReferenceEquals(t, readBy)) { message = "The CA Debugger pad was replaced; try again."; return false; }
+            if (!SafeIsReady(t)) { message = "The CA Debugger pad is still loading; try again in a moment."; return false; }
+            return t.CmdBreakOnProcEntryAt(filePath, line, out message);
+        }
+
+        /// <summary>Holds <see cref="BreakOnProcEntry"/>'s message to the contract: one line, never empty, at
+        /// most <see cref="MaxMessage"/> characters.</summary>
+        private static string OneLine(string text, bool ok)
+        {
+            string s = (text ?? "").Replace("\r\n", " ").Replace('\r', ' ').Replace('\n', ' ').Trim();
+            if (s.Length == 0)
+                s = ok ? "Break on entry: set." : "Break on entry: nothing was set, and the debugger gave no reason.";
+            if (s.Length > MaxMessage) s = s.Substring(0, MaxMessage - 3) + "...";
+            return s;
+        }
 
         public static void Pause()
         {
@@ -207,6 +323,34 @@ namespace ClarionDebugger
             DebugControllerState s;
             lock (_gate) { t = _target; s = _state; }
             if (t == null) return;
+
+            // THREAD GUARD. Every target method is UI-thread code: they drive WebView2, and CmdRunToCursor
+            // mutates the transient-breakpoint list with no lock of its own. The forwarders above are public
+            // and RunToCursor is reached by REFLECTION from ClarionAssistant, so nothing here can assume the
+            // caller is on the pad's thread.
+            //
+            // Marshal rather than reject. Every forwarder routed here is void by frozen contract, so a refusal is
+            // unobservable to the caller — an off-thread context-menu command would just look like the
+            // debugger ignoring the user, which is the silent failure this whole ticket is about.
+            //
+            // Re-entering Invoke on the pad's thread re-reads the target and re-runs the guards THERE, so a
+            // state change while the post was in flight is still honoured; on that pass InvokeRequired is
+            // false and it falls through, so this cannot recurse.
+            //
+            // Through the TARGET'S OWN marshal, which the interface requires (fc8d63f5). It used to be
+            // `t as Control`, so a target that was not a Control ran on the caller's thread. A Control whose
+            // handle is not created yet reports InvokeRequired false, so it still runs inline as it always
+            // did - there is no thread to post to.
+            bool offThread;
+            try { offThread = t.InvokeRequired; }
+            catch (Exception ex) { Debug.WriteLine("[DebugSessionController] InvokeRequired threw: " + ex.Message); return; }
+            if (offThread)
+            {
+                try { t.BeginInvoke((Action)(() => Invoke(action, requireReady, allowed)), null); }
+                catch (Exception ex) { Debug.WriteLine("[DebugSessionController] marshal failed: " + ex.Message); }
+                return;
+            }
+
             if (allowed != null && !allowed(s)) return;       // state-guard: stale-enabled click => no-op
             if (requireReady && !SafeIsReady(t)) return;
             try { action(t); }

@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Services
 {
@@ -74,9 +75,67 @@ namespace ClarionDebugger.Services
     public sealed class DebugBreakpoint
     {
         public string Module;
-        public int RequestedLine;
+
+        private int? _requestedLine;
+
+        /// <summary>The line the user asked for, or null when the engine's echo carried no
+        /// <c>requestedLine</c> member AT ALL (a build older than that protocol change).
+        /// <para>
+        /// ABSENT IS NOT 0. 0 is a real requested line — an unresolved raw (--rva) breakpoint has one —
+        /// which is exactly why <c>bp-del</c> has always read this field with <c>GetIntOrNull</c>. Reading it
+        /// with <c>GetInt</c> gave every breakpoint in a module the same requested line of 0 against an older
+        /// engine, and <see cref="ClarionDebuggerService.SameBpIdentity"/> then merged them all into one pane
+        /// row. Host-built entries (the IDE gutter, a pending entry the pad adds before the engine confirms)
+        /// always know the line they asked for, so only a parsed echo can leave this null.
+        /// </para></summary>
+        public int? RequestedLineOrNull
+        {
+            get { return _requestedLine; }
+            set { _requestedLine = value; }
+        }
+
+        /// <summary>The requested line when there is one, else the PLANTED line — the best line this
+        /// breakpoint can be shown or re-specified by. Every display, gutter and spec-building reader wants
+        /// this; nothing may use it for IDENTITY, which goes through
+        /// <see cref="ClarionDebuggerService.SameBpIdentity"/> so an absent requested line falls back
+        /// explicitly instead of comparing as 0.
+        /// <para>
+        /// GET-ONLY, and named for what it is (f367a04f). This was <c>RequestedLine</c>, with a setter, so the
+        /// one name meant "the line the user asked for" when written and "that, or the planted line" when
+        /// read - and a reader could not tell from the name that it might be getting the planted line. The
+        /// setter is gone: <see cref="RequestedLineOrNull"/> is the sole writer, and a host-built entry sets
+        /// it to record the line AS PRESENT.
+        /// </para></summary>
+        public int DisplayLine
+        {
+            get { return _requestedLine ?? Line; }
+        }
+
         public int Line;            // line actually planted (snapped to nearest code record)
         public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
+
+        /// <summary>The OWNING IMAGE (EXE/DLL) the engine armed this breakpoint in, as the engine
+        /// reported it, or null when it did not say.
+        /// <para>
+        /// <c>Module</c> is a BASENAME, and two loaded DLLs can each carry a <c>clbrws011.clw</c>. Without
+        /// the owner, a breakpoint in each of them has the same identity and the two collapse into one pane
+        /// row. This is the second half of the identity key, read by
+        /// <see cref="ClarionDebuggerService.BpOwnerMatches"/>.
+        /// </para>
+        /// <para>
+        /// NULL MEANS UNKNOWN, and unknown matches ANY owner — which is what keeps an engine build older
+        /// than the <c>ownerPath</c> protocol change behaving exactly as it did before. It is also what a
+        /// host-built entry (a gutter bookmark, a pending entry the pad staged) has, since only the engine
+        /// knows which image a compiland came from. The engine writes JSON null for a still-pending
+        /// breakpoint, which reads back the same way and means the same thing.
+        /// </para>
+        /// <para>
+        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw. Since 079ff431
+        /// GetStr unescapes, so it reads back as the image's real path - but that does not make it a file
+        /// the host should open, and nothing does: it is only ever compared with another owner read the
+        /// same way, which is why unescaping both sides at once left every comparison unchanged.
+        /// </para></summary>
+        public string OwnerPath;
 
         // ---- advanced breakpoint properties (conditional / hit count / tracepoint) ----
         public string Condition;    // expression; pause only when true (null/empty = unconditional)
@@ -141,9 +200,86 @@ namespace ClarionDebugger.Services
     /// the read paths are currently pointed at, and the list itself (stopped thread first).</summary>
     public sealed class DebugThreadList
     {
-        public uint StoppedTid;
-        public uint SelectedTid;
+        /// <summary>The thread the engine stopped on, and the one it has selected - NULL when the engine
+        /// did not say which.
+        /// <para>
+        /// ABSENT IS NOT 0, for the same reason it is not for a reply's <c>tid</c>: no Win32 thread has id
+        /// 0, so a 0 standing in for "unknown" reads downstream as a REAL thread and makes the consumer
+        /// discard good data against it. The engine writes these members only when the id is known and
+        /// leaves them out otherwise (task 3b043dfc); reading them with GetUIntOrNull and then
+        /// substituting 0u threw that distinction away on arrival, which is the one place a host can undo
+        /// a wire rule unilaterally.
+        /// </para></summary>
+        public uint? StoppedTid;
+        public uint? SelectedTid;
         public List<DebugThread> Threads = new List<DebugThread>();
+    }
+
+    /// <summary>Why the host's selected thread changed.</summary>
+    /// <remarks>Ended: a session is over. Reset: a new session is starting and has selected nothing yet.</remarks>
+    public enum ThreadSelectionCause { None, Stop, Switch, Inventory, Ended, Reset }
+
+    /// <summary>The host's ONE copy of which thread is selected (49538b78 item 8b, Owner decision 3,
+    /// 2026-09-24): ClarionDebuggerService owns it and is its only writer, and every host consumer reads what
+    /// the service delivered. Before, the Disassembly view and the grant table each kept their own copy, fed
+    /// by their own subset of the events, and nothing made the copies agree.
+    /// <para>
+    /// IMMUTABLE, because the service changes it on the engine's reader thread and the views act on it on the
+    /// UI thread after a BeginInvoke. A view that re-read the service's CURRENT selection there could be
+    /// ahead of the event it is handling (a stop's handler seating the stopped VA under a newer switch), so
+    /// <see cref="ClarionDebuggerService.SelectionChanged"/> hands each consumer the snapshot that event made.
+    /// </para>
+    /// <para>
+    /// <see cref="Epoch"/> comes from ONE counter for the whole process, rising with every change of any
+    /// service and never reset: a pad's service runs session after session, and the Disassembly view outlives
+    /// a service when a different one becomes active (pipeline run 1, debugger L1). A consumer that drops a
+    /// snapshot older than the one it holds must never meet epochs that start again from zero.
+    /// <see cref="Source"/> names the service that made it, so a consumer can drop one from a service it is no
+    /// longer bound to.
+    /// </para></summary>
+    public sealed class ThreadSelection
+    {
+        public static readonly ThreadSelection None = new ThreadSelection(null, null, 0, ThreadSelectionCause.None);
+
+        /// <summary>The selected thread: the thread every thread-scoped read targets. Null when unknown
+        /// (no stop yet, the session ended, or an engine that did not name it); never 0.</summary>
+        public readonly uint? Tid;
+        /// <summary>The thread the engine stopped on, null when unknown.</summary>
+        public readonly uint? StoppedTid;
+        public readonly int Epoch;
+        public readonly ThreadSelectionCause Cause;
+        /// <summary>The service that made this snapshot (null for <see cref="None"/>).</summary>
+        public readonly object Source;
+
+        public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause)
+            : this(tid, stoppedTid, epoch, cause, null) { }
+
+        public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause, object source)
+        {
+            Tid = WireRules.TidIsKnown(tid) ? tid : null;
+            StoppedTid = WireRules.TidIsKnown(stoppedTid) ? stoppedTid : null;
+            Epoch = epoch;
+            Cause = cause;
+            Source = source;
+        }
+    }
+
+    /// <summary>The engine left an ATTACHED process running (3f2d747f): its <c>detached</c> event.</summary>
+    public sealed class DebugDetach
+    {
+        public uint? Pid;
+        /// <summary>The attached process's image name, from the listing the attach was made from (the event
+        /// itself names only the pid).</summary>
+        public string Name;
+        public int Drained;         // queued debug events the engine drained before it let go
+        /// <summary>How many breakpoint bytes the engine put back (Json.Detached writes a COUNT), or -1 when the
+        /// event carried no readable number. INFORMATIONAL ONLY: 0 is a clean detach with nothing planted, and
+        /// unknown is not a failure. Whether a restore failed is <see cref="Error"/>'s job alone.</summary>
+        public int Restored;
+        /// <summary>Why a restore (or the stop itself) failed, or null. The engine sets it whenever any restore
+        /// failed, so non-null - and only non-null - means the app may still hold an INT3 it will hit with no
+        /// debugger attached, which will most likely crash it.</summary>
+        public string Error;
     }
 
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
@@ -161,9 +297,15 @@ namespace ClarionDebugger.Services
         public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
         public string Error;        // resolved by name but unreadable (e.g. a THREADed instance the RTL wouldn't yield)
         public string Note;         // a real but qualified value (e.g. a THREADed variable this thread hasn't used yet)
+        public string Addr;         // this thread's OWN storage (hex) for "View memory"; null for a template read
+        public int? FrameIdx;       // the frame a local head resolved in, when not frame 0; null otherwise
+        public string FrameProc;    // that frame's procedure name (with FrameIdx)
         /// <summary>The thread this value was read on, or null from an engine that doesn't stamp replies.
         /// The pad drops a reply whose Tid isn't the thread it is currently showing.</summary>
         public uint? Tid;
+        /// <summary>The request id the engine echoed (<c>"reqId"</c>), or null when the request carried none or the
+        /// engine predates the echo (3517fd15). Only a reply echoing an id the host recorded may grant an edit.</summary>
+        public string ReqId;
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -177,6 +319,15 @@ namespace ClarionDebugger.Services
         /// ROUTINE it sits in and the procedure that encloses it; the Procedures PANEL filters them back out
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
+        /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
+        /// 0 = unknown. The bundled engine sends it for every procedure it can bound since e049e07 (6fa242ae); a
+        /// position lookup on a procedure without one is refused either way.</summary>
+        public int EndLine;
+        /// <summary>True when the engine said it could NOT bound this procedure (<c>"extent":"unknown"</c> in
+        /// place of <c>endLine</c>, f1a98318): the debug info gave no end, which a same-build engine does for some
+        /// real procedures. False with no EndLine means the engine sent neither member, so it predates this.
+        /// The two refusals word the cause differently; both still refuse.</summary>
+        public bool ExtentUnknown;
     }
 
     /// <summary>
@@ -198,6 +349,10 @@ namespace ClarionDebugger.Services
         public static event Action ActiveChanged;
 
         private Process _proc;
+        // The process _proc is ATTACHED to (3f2d747f), or null when _proc LAUNCHED its target. Assigned with
+        // _proc and only there, so it always describes the current engine. It is what makes Stop detach instead
+        // of quit - a quit TERMINATES the target, which in attach mode is an app the user did not start here.
+        private AttachableProcess _attachTarget;
         private string _targetDir; // target EXE's directory — anchors relative .red redirection paths
         private readonly object _stateLock = new object();
         private DebugSessionState _state = DebugSessionState.Idle;
@@ -209,7 +364,8 @@ namespace ClarionDebugger.Services
         public event Action<DebugPause> Paused;
         public event Action<string> Resumed;                       // resume mode: continue/step/stepover/stepout
         public event Action<DebugBreakpoint> BreakpointSet;
-        public event Action<string, int> BreakpointRemoved;        // module, line
+        public event Action<string, int> BreakpointRemoved;        // module, requested line (planted line
+                                                                  // only from a pre-requestedLine engine)
         public event Action<string, int, string> BreakpointError;  // module, line, error
         public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
@@ -217,31 +373,89 @@ namespace ClarionDebugger.Services
         // per-event stamp). The pad uses it to DROP a reply for a thread it is no longer showing: a thread
         // switch leaves the previous thread's replies in flight, and painting one into the new thread's
         // panels would show one thread's values under another thread's name.
-        public event Action<List<DebugStackFrame>, uint?> StackReceived;  // resolved call stack (frames, tid)
-        public event Action<string, string, uint?> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid)
+        public event Action<List<DebugStackFrame>, uint?, string> StackReceived;  // resolved call stack (frames, tid, reqId)
+        public event Action<string, string, uint?, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid, reqId)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
         public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
+        public event Action<string, string, int, int, string, string> MemReceived; // Memory panel read (reqId, addr, len requested, bytes read, hex bytes, error-or-null)
         public event Action<Dictionary<string, string>, uint?> RegsReceived; // standalone regs reply (regs, tid)
         public event Action<DebugThreadList> ThreadsReceived;      // thread inventory for the current stop
         // 'thread <tid>' result. The tid is the thread that was ASKED FOR (null when the request was
         // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
         // the selection it had and asks 'threads' for the authoritative one.
         public event Action<uint?, bool, string> ThreadSelected;
-        public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
+        // The host's selected thread moved (49538b78 8b): the new snapshot. Raised BEFORE the event that moved
+        // it (Paused, ThreadSelected, ThreadsReceived, Exited), so a consumer handling that event has already
+        // been handed the selection it made.
+        public event Action<ThreadSelection> SelectionChanged;
+        // Hover mode (f6e547ce): (thread owning the window under the cursor, or null for none; on; paused).
+        public event Action<uint?, bool, bool> HoverChanged;
+        // Disassembly listing (tag, instrs, tid). The tid is the thread the engine actually DECODED, and it
+        // was the one thread-scoped reply whose invoke dropped it while the decoder below already parsed it
+        // — so the view could only ever gate on its own bookkeeping, never on the engine's own answer.
+        public event Action<string, List<DebugDisasmInstr>, uint?> DisasmReceived;
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
         public event Action<string> EngineError;                   // engine-reported error event
+        public event Action<bool, string, string, int, string> SetIpResult; // set next statement: ok, refusal code, module, line, user text
         public event Action<string> LogReceived;
         public event Action<int> Exited;
+        public event Action<DebugDetach> Detached;                 // an attached session let its process go (it keeps running)
+        // Stop had to KILL an attached engine that did not detach in time (the listed target, or null). The app may
+        // still hold planted breakpoints and will probably crash (3f2d747f). Raised on Stop's thread, before it returns.
+        public event Action<AttachableProcess> DetachAbandoned;
 
         public bool IsRunning { get { return _proc != null && !_proc.HasExited; } }
+
+        /// <summary>True when the current engine is ATTACHED to a process rather than having launched it.</summary>
+        public bool IsAttachSession { get { return _attachTarget != null; } }
 
         public DebugSessionState State
         {
             get { lock (_stateLock) return _state; }
+        }
+
+        private readonly object _selectionLock = new object();
+        private ThreadSelection _selection = ThreadSelection.None;
+        // Every service's epochs come from this one counter (see ThreadSelection.Epoch).
+        private static int s_selectionEpoch;
+
+        /// <summary>The host's selected thread NOW (see <see cref="ThreadSelection"/>). A handler of an event
+        /// marshalled to the UI thread reads the snapshot SelectionChanged handed it instead: this one can
+        /// already be a later event's.</summary>
+        public ThreadSelection Selection
+        {
+            get { lock (_selectionLock) return _selection; }
+        }
+
+        /// <summary>The ONE writer of the host's selected thread. A move to the same threads is no change when
+        /// <paramref name="onlyIfChanged"/> (an inventory repeating what the host knows, a second end); every
+        /// other call is a change, with the next epoch, and is raised. A Switch keeps the stopped thread the
+        /// selection holds when the lock is taken, and <paramref name="stoppedTid"/> is ignored for it: read
+        /// before the lock, it could restore a stopped thread a concurrent end had just cleared.</summary>
+        private void MoveSelection(uint? tid, uint? stoppedTid, ThreadSelectionCause cause, bool onlyIfChanged)
+        {
+            ThreadSelection next;
+            lock (_selectionLock)
+            {
+                var cur = _selection;
+                if (cause == ThreadSelectionCause.Switch) stoppedTid = cur.StoppedTid;
+                var probe = new ThreadSelection(tid, stoppedTid, cur.Epoch, cause);
+                if (onlyIfChanged && probe.Tid == cur.Tid && probe.StoppedTid == cur.StoppedTid) return;
+                _selection = next = new ThreadSelection(tid, stoppedTid,
+                    System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);
+            }
+            SelectionChanged?.Invoke(next);
+        }
+
+        /// <summary>The inventory's selection: the selected thread when it names one, else the stopped one
+        /// (a SelectedTid of literal 0 is a sentinel, not a selection).</summary>
+        internal static uint? InventorySelection(DebugThreadList list)
+        {
+            return WireRules.TidIsKnown(list.SelectedTid) ? list.SelectedTid : list.StoppedTid;
         }
 
         /// <summary>EIP (hex) at the current pause, or null when running/idle. Lets a pad that opens
@@ -309,6 +523,48 @@ namespace ClarionDebugger.Services
             MemLo = MemHi = 0;   // fresh module span for this session (drives the disasm coarse scrollbar)
             var args = new System.Text.StringBuilder();
             args.Append("break \"").Append(targetExe).Append("\" --interactive --json");
+            AppendSessionOptions(args, breakpoints, solutionDlls);
+            Launch(targetExe, args.ToString(), true, null);
+        }
+
+        /// <summary>
+        /// Attach to a process that is already running (3f2d747f), with the same breakpoint and solution-DLL
+        /// options a launch takes. <paramref name="target"/> must come from <see cref="ListProcesses"/>: the pad
+        /// accepts only a pid it listed itself. The session then behaves as a launched one, except that
+        /// <see cref="Stop"/> DETACHES and leaves the process running.
+        /// </summary>
+        public void AttachSession(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
+            string args = BuildAttachArgs(target, breakpoints, solutionDlls);   // throws before anything starts
+            if (!ReferenceEquals(Active, this)) { Active = this; ActiveChanged?.Invoke(); }
+            MemLo = MemHi = 0;
+            Launch(target.Path, args, true, target);
+        }
+
+        /// <summary>The engine command line for an attach: <c>attach &lt;pid&gt; --interactive --json --expect-start
+        /// &lt;started&gt;</c> plus the shared session options. Throws, starting nothing, for no target or no start time.
+        /// <para>
+        /// A PID IS NOT AN IDENTITY: between the listing and the attach the listed process can exit and another take
+        /// its pid. The engine checks the process's creation time against --expect-start and refuses a mismatch
+        /// ("pid reused"), so an attach never goes out without the start time the listing reported.
+        /// </para></summary>
+        internal static string BuildAttachArgs(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
+            if (target == null || target.Pid == 0) throw new ArgumentException("No process to attach to.");
+            if (!AttachableProcess.IsStartTime(target.Started))
+                throw new ArgumentException("The process list gave no start time for pid " + target.Pid.ToString(CultureInfo.InvariantCulture)
+                    + ", so the debugger cannot prove it is still the process that was listed.");
+            var args = new System.Text.StringBuilder();
+            args.Append("attach ").Append(target.Pid.ToString(CultureInfo.InvariantCulture)).Append(" --interactive --json")
+                .Append(" --expect-start ").Append(target.Started);
+            AppendSessionOptions(args, breakpoints, solutionDlls);
+            return args.ToString();
+        }
+
+        /// <summary>The <c>--bp</c> and <c>--solution-dll</c> options, shared by a launch and an attach so the two
+        /// can never pass a session different options.</summary>
+        private static void AppendSessionOptions(System.Text.StringBuilder args, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
             if (breakpoints != null)
                 foreach (var bp in breakpoints)
                 {
@@ -324,7 +580,6 @@ namespace ClarionDebugger.Services
                     if (string.IsNullOrEmpty(dll) || dll.IndexOf('"') >= 0) continue;
                     args.Append(" --solution-dll \"").Append(dll).Append('"');
                 }
-            Launch(targetExe, args.ToString(), true);
         }
 
         /// <summary>
@@ -334,20 +589,75 @@ namespace ClarionDebugger.Services
         {
             string args = "break \"" + targetExe + "\" --line " + line + " --module " + module + " --json --timeout 60000";
             if (once) args += " --once";
-            Launch(targetExe, args, false);
+            Launch(targetExe, args, false, null);
         }
 
-        private void Launch(string targetExe, string args, bool interactive)
+        /// <summary>What Launch may do, given whether an engine process is still alive and the session state.
+        /// <para>
+        /// The case this exists for (0449e5c9): the DEBUGGEE finished, the engine said "exited", and the state
+        /// went Idle at once - by the Owner's decision, so a run-to-completion reads as over immediately. The
+        /// engine PROCESS can outlive that by a moment, and a Start pressed inside that window used to hit
+        /// "A debug session is already running." for a session the user had just been told was over. It is
+        /// now refused with the truth instead (<see cref="EngineClosingMessage"/>), and
+        /// <see cref="ReapLingeringEngine"/> closes the window from the other side.
+        /// </para></summary>
+        internal enum LaunchGate { Proceed, RefuseClosing, AlreadyRunning }
+
+        internal static LaunchGate DecideLaunch(bool engineAlive, DebugSessionState state)
         {
-            if (IsRunning) throw new InvalidOperationException("A debug session is already running.");
+            if (!engineAlive) return LaunchGate.Proceed;
+            return state == DebugSessionState.Idle ? LaunchGate.RefuseClosing : LaunchGate.AlreadyRunning;
+        }
+
+        /// <summary>The one wording of the refusal, shared by the pad's pre-check and Launch's own.</summary>
+        public const string EngineClosingMessage =
+            "the previous session's engine is still closing — press Start again in a moment";
+
+        /// <summary>True in the short window after a session reported itself over (Idle) while its engine
+        /// process has not exited yet. A Start in that window is refused with <see cref="EngineClosingMessage"/>.</summary>
+        public bool IsEngineStillClosing { get { return DecideLaunch(IsRunning, State) == LaunchGate.RefuseClosing; } }
+
+        /// <summary>How long an engine may outlive its own "exited" event before it is stopped for it.</summary>
+        internal const int ReapGraceMs = 1500;
+
+        /// <summary>Give <paramref name="engine"/> <paramref name="graceMs"/> to exit on its own, and if it has
+        /// not, call <paramref name="stop"/>. Blocking: the caller runs it off the UI thread. Returns true when
+        /// it had to stop the engine. A process whose state cannot be read counts as still running, so it is
+        /// stopped rather than trusted (the same "cannot tell is not dead" rule as ProcessConfirmedDead).</summary>
+        internal static bool ReapLingeringEngine(Process engine, int graceMs, Func<bool> stop)
+        {
+            if (engine == null) return false;
+            bool exited;
+            try { exited = engine.WaitForExit(graceMs); }
+            catch { exited = false; }
+            if (exited) return false;
+            stop();
+            return true;
+        }
+
+        /// <param name="attachTo">The process an ATTACH session attaches to, or null for a launch. An attach
+        /// session's <paramref name="targetExe"/> is that process's image path, as listed: it anchors the .red
+        /// resolver, but an attach does not need the file, so a path that no longer resolves is not an error.</param>
+        private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)
+        {
+            switch (DecideLaunch(IsRunning, State))
+            {
+                case LaunchGate.RefuseClosing:
+                    // Refused, not thrown: this is a moment to wait, not a failure (0449e5c9).
+                    LogReceived?.Invoke(EngineClosingMessage);
+                    return;
+                case LaunchGate.AlreadyRunning:
+                    throw new InvalidOperationException("A debug session is already running.");
+            }
 
             string engine = FindEngine();
             if (engine == null) throw new FileNotFoundException("ClarionDbg.exe not found next to the addin or in the dev build output.");
-            if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe))
+            bool haveImage = !string.IsNullOrEmpty(targetExe) && File.Exists(targetExe);
+            if (!haveImage && attachTo == null)
                 throw new FileNotFoundException("Target executable not found: " + targetExe);
 
             lock (_breakpoints) _breakpoints.Clear();
-            string newTargetDir = Path.GetDirectoryName(Path.GetFullPath(targetExe));
+            string newTargetDir = haveImage ? Path.GetDirectoryName(Path.GetFullPath(targetExe)) : null;
             if (!string.Equals(newTargetDir, _targetDir, StringComparison.OrdinalIgnoreCase))
                 _redFallback = null; // different target → its local .red may differ; re-resolve lazily
             _targetDir = newTargetDir;
@@ -359,62 +669,198 @@ namespace ClarionDebugger.Services
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 RedirectStandardInput = interactive,
-                WorkingDirectory = Path.GetDirectoryName(targetExe)
+                WorkingDirectory = newTargetDir ?? Path.GetDirectoryName(engine)
             };
 
-            _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            _proc.OutputDataReceived += (s, e) => { if (e.Data != null) OnLine(e.Data); };
-            _proc.ErrorDataReceived += (s, e) => { if (e.Data != null) LogReceived?.Invoke(e.Data); };
-            _proc.Exited += (s, e) =>
-            {
-                int code = 0;
-                try { code = _proc.ExitCode; } catch { }
-                SetState(DebugSessionState.Idle);
-                Exited?.Invoke(code);
-            };
+            // Every handler is bound to THIS process, `p`, never to the field. _proc names whichever engine
+            // is CURRENT, and an old engine's buffered output or late Exited can arrive after a new one has
+            // been launched into it - reading _proc there acts on the wrong engine (0449e5c9, pipeline run 1).
+            var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            p.OutputDataReceived += (s, e) => { if (e.Data != null) OnLine(p, e.Data); };
+            p.ErrorDataReceived += (s, e) => { if (e.Data != null) LogReceived?.Invoke(e.Data); };
+            p.Exited += (s, e) => OnEngineProcessExited(p);
+            _proc = p;
+            _attachTarget = attachTo;
 
+            // A new session has no thread selected yet. The epoch carries on from the last session's.
+            MoveSelection(null, null, ThreadSelectionCause.Reset, true);
             SetState(DebugSessionState.Launching);
-            _proc.Start();
-            _proc.BeginOutputReadLine();
-            _proc.BeginErrorReadLine();
+            p.Start();
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+        }
+
+        /// <summary>An engine PROCESS ended. Only the current engine's end means the session is over: an old
+        /// engine that dies after a new one was launched must not set the new session Idle, nor raise Exited
+        /// (whose handler clears the pad's session state) on its behalf.</summary>
+        private void OnEngineProcessExited(Process source)
+        {
+            if (!ReferenceEquals(source, _proc)) return;
+            int code = 0;
+            try { code = source.ExitCode; } catch { }
+            // No attached state outlives its engine. A FAILED attach ends here: the engine reports
+            // {"event":"error","message":"attach failed: ...","code":N} (N may be 0, which is NOT success) and
+            // exits 2. Only `loaded` moves a session out of Launching; an error never does.
+            _attachTarget = null;
+            SetState(DebugSessionState.Idle);
+            MoveSelection(null, null, ThreadSelectionCause.Ended, true);
+            Exited?.Invoke(code);
+        }
+
+        /// <summary>The engine reported "exited": its DEBUGGEE finished. Idle at once, by the Owner's decision
+        /// (0449e5c9 option C) - but only when <paramref name="source"/> is the CURRENT engine. The line is
+        /// read off a buffered pipe and can arrive after that engine's own Exited has already set Idle and a
+        /// new session has been launched; acting on it then would declare the NEW session over.
+        /// <para>
+        /// The reap is always of <paramref name="source"/>: it is given ReapGraceMs to exit and is then killed
+        /// by <see cref="KillEngine"/>, which acts on that process object and nothing else. A Start meanwhile
+        /// is refused honestly (<see cref="DecideLaunch"/>).
+        /// </para></summary>
+        private void OnEngineReportedExit(Process source)
+        {
+            if (ReferenceEquals(source, _proc))
+            {
+                CurrentVa = null;
+                _attachTarget = null;   // the session is over, so nothing is attached any more
+                SetState(DebugSessionState.Idle);
+                MoveSelection(null, null, ThreadSelectionCause.Ended, true);
+            }
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { ReapLingeringEngine(source, ReapGraceMs, () => KillEngine(source)); }
+                catch (Exception ex) { LogReceived?.Invoke("[stop] reap after exit failed: " + ex.Message); }
+            });
+        }
+
+        /// <summary>Kill <paramref name="engine"/> - that process, not whatever _proc names by now - and wait,
+        /// bounded, for it to go. True when it is confirmed gone. Used only for an engine that has already
+        /// reported its debuggee exited, so there is no session left in it to quit cleanly.</summary>
+        internal static bool KillEngine(Process engine)
+        {
+            if (engine == null) return true;
+            try { if (!engine.HasExited) engine.Kill(); }
+            catch { }
+            try { return engine.WaitForExit(3000); }
+            catch { return false; }
+        }
+
+        /// <summary>True when the engine process is CONFIRMED gone — no process at all, or the OS says this
+        /// one has exited. A HasExited that throws answers FALSE: "cannot tell" must never be reported as
+        /// "dead", which is the whole point of the postcondition below.</summary>
+        private bool ProcessConfirmedDead()
+        {
+            var p = _proc;
+            if (p == null) return true;
+            try { return p.HasExited; }
+            catch (Exception ex)
+            {
+                LogReceived?.Invoke("[stop] cannot confirm engine exit: " + ex.Message);
+                return false;
+            }
         }
 
         /// <summary>
-        /// Authoritative teardown barrier. When this returns, the engine/target process is GONE and State is
-        /// Idle — every code path (graceful quit, forced kill, or already-dead) guarantees both before return.
-        /// Prefers a clean engine-side quit (which also kills the target); on timeout it Kills and confirms the
-        /// process actually exited via WaitForExit (bounded so a wedged process can't hang the teardown thread
-        /// forever). Always drives State=Idle synchronously at the end — the async _proc.Exited / "exited" path
-        /// that also sets Idle is idempotent (SetState's `changed` guard), so the double-set is harmless.
+        /// How long Stop waits for a launch-mode engine to act on <c>quit</c>.</summary>
+        internal const int QuitWaitMs = 1500;
+
+        /// <summary>How long Stop waits for an ATTACHED engine to act on <c>detach</c>. Longer than
+        /// <see cref="QuitWaitMs"/>: a running target needs a pause round-trip before the engine can restore and
+        /// drain (the frozen engine contract, 3f2d747f).</summary>
+        internal const int DetachWaitMs = 8000;
+
+        /// <summary>The verb that ends a session cleanly: <c>detach</c> leaves an attached process running, and
+        /// <c>quit</c> terminates a launched one. Never <c>quit</c> for an attach: it would kill an app the user
+        /// did not start from here.</summary>
+        internal static string TeardownCommand(bool attached)
+        {
+            return attached ? "detach" : "quit";
+        }
+
+        /// <summary>
+        /// Teardown barrier. Prefers a clean engine-side quit (which also kills the target); on timeout it Kills
+        /// and waits. It then ASKS whether the process is dead rather than assuming the above worked, and
+        /// returns that answer: true means <see cref="IsRunning"/> is confirmed false and State is Idle.
+        ///
+        /// A false return means the engine process could NOT be confirmed dead inside the bounded waits. On that
+        /// path State is deliberately NOT driven to Idle: publishing Idle over a live process is what would
+        /// re-enable Start (the toolbar and pad both reach Idle through DebugSessionController, which reads this
+        /// state via IDebugSessionTarget.IsSessionIdle) and let a new session launch against a target still owned
+        /// by the old process. _proc.Exited stays subscribed and drives Idle if and when the process does die.
+        /// Callers that need the guarantee must check the result; callers that ignore it are no worse off than
+        /// before, because the state they would have seen as Idle now simply stays where it was.
+        ///
+        /// The one path that reports Idle WITHOUT this check is the engine's "exited" event (the DEBUGGEE
+        /// finished): it sets Idle at once by decision (0449e5c9 option C), and covers the engine process's
+        /// remaining lifetime by reaping THAT process (<see cref="ReapLingeringEngine"/> with <see cref="KillEngine"/>, not
+        /// this method - Stop() reads _proc, which may name a newer engine by then) and by
+        /// refusing a Start until it is gone (<see cref="DecideLaunch"/>).
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
         /// synchronously but there is no live process to wait on, so it returns immediately).
+        ///
+        /// ATTACH MODE (3f2d747f) sends <c>detach</c> instead of <c>quit</c>, and waits
+        /// <see cref="DetachWaitMs"/>: a running target is paused first, then every planted byte is restored and
+        /// the queued events drained, all before the engine can exit. The app keeps running.
         /// </summary>
-        public void Stop()
+        public bool Stop()
         {
             try
             {
                 if (IsRunning)
                 {
-                    // A successful pipe write does NOT prove the engine consumed 'quit', so verify exit and fall
-                    // back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
-                    // (Kill only requests termination) before we declare teardown complete.
-                    bool exited = SendCommand("quit") && _proc.WaitForExit(1500);
+                    // A successful pipe write does NOT prove the engine consumed the command, so verify exit and
+                    // fall back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
+                    // (Kill only requests termination).
+                    bool attached = IsAttachSession;
+                    var target = _attachTarget;   // captured: the exit handler clears the field
+                    var engine = _proc;
+                    bool exited = SendCommand(TeardownCommand(attached))
+                               && _proc.WaitForExit(attached ? DetachWaitMs : QuitWaitMs);
+                    // An attached engine's LAST words are its `detached` event, and it may carry an error (bytes left
+                    // planted: the app may crash). The timed wait returns at process exit, possibly before the
+                    // buffered line is read; the untimed wait returns only once redirected output has been drained,
+                    // so Detached is raised BEFORE Stop returns - and so before a caller that observes teardown
+                    // (the pad's Dispose, 3f2d747f) stops listening. The process has already exited, so this is bounded.
+                    if (exited && attached)
+                    {
+                        try { engine.WaitForExit(); }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] reading the engine's last output failed: " + ex.Message); }
+                    }
                     if (!exited && IsRunning)
                     {
-                        try { _proc.Kill(); } catch { }
-                        try { _proc.WaitForExit(3000); } catch { } // bounded — don't hang forever on a wedged process
+                        // ATTACH MODE: KILL IS THE LAST RESORT, AND IT WILL PROBABLY CRASH THE USER'S APP. A killed
+                        // engine never restores the INT3 bytes it planted or clears the trap flag, so the app
+                        // takes an unhandled breakpoint/single-step exception the next time it reaches one.
+                        // Detach is the clean path; the kill below only runs when the engine did not exit within
+                        // DetachWaitMs, and a wedged engine would otherwise hold the session forever. Owner
+                        // decision 2026-09-23: that crash risk is accepted, and the user is told.
+                        if (attached)
+                            LogReceived?.Invoke("[stop] the engine did not detach within " + (DetachWaitMs / 1000)
+                                + " s, so it is being killed. The attached app may crash at the next breakpoint it reaches.");
+                        // Escalate deliberately: wait -> kill -> verify. A Kill that throws is information the
+                        // caller needs (the handle may be denied, or the process already reaped), so it is
+                        // surfaced instead of swallowed. Neither failure decides the outcome on its own — the
+                        // check below does.
+                        try { _proc.Kill(); }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] kill failed: " + ex.Message); }
+                        try { _proc.WaitForExit(3000); }   // bounded — don't hang forever on a wedged process
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] wait after kill failed: " + ex.Message); }
+                        // A typed signal as well as the log line: the log line is for the console, and a pad that is
+                        // closing has none. Its teardown observer turns this into a warning that does not need the page.
+                        if (attached) DetachAbandoned?.Invoke(target);
                     }
                 }
             }
-            catch { }
-            finally
-            {
-                // Authoritative: once Stop() returns, the session is over. Synchronous so a teardown driver
-                // (Dispose -> NotifyStopped) sees Idle deterministically without waiting on the async Exited.
-                SetState(DebugSessionState.Idle);
-            }
+            catch (Exception ex) { LogReceived?.Invoke("[stop] teardown error: " + ex.Message); }
+
+            // The postcondition, asked as a question. Nothing above is trusted to have worked: this single check
+            // is what decides whether the session may be reported over.
+            bool dead = ProcessConfirmedDead();
+            if (dead) SetState(DebugSessionState.Idle);
+            else LogReceived?.Invoke("[stop] engine process did not exit within the teardown timeout — "
+                                   + "session NOT reported idle, Start stays disabled until it does");
+            return dead;
         }
 
         // ------------------------------------------------------------------ execution control
@@ -438,10 +884,26 @@ namespace ClarionDebugger.Services
                 && !module.Contains("..");
         }
 
-        /// <summary>Add a breakpoint (engine snaps to the nearest code-record line and replies bp-set).</summary>
+        /// <summary>Add a breakpoint (engine snaps to the nearest code-record line and replies bp-set).
+        /// <para>
+        /// UNQUALIFIED, ALWAYS. A .clw name is a bare BASENAME, so in a multi-DLL app several loaded images
+        /// can carry a compiland of that name, and an unqualified add arms in ALL of them (task af81c054),
+        /// including images that load later. Run-to-cursor sends exactly this too (contract C3, 1be3b82e):
+        /// the host cannot name the image the caret's file is compiled into, and arming only the engine's
+        /// first pick could run past the line the user meant. The engine still parses <c>|one=1</c>; nothing
+        /// here sends it.
+        /// </para></summary>
         public bool AddBreakpoint(string module, int line)
         {
             return IsValidModuleName(module) && SendCommand("bp add " + module + ":" + line);
+        }
+
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line within
+        /// the procedure it is in. The engine decides whether that is safe and answers with a `setip` event
+        /// (<see cref="SetIpResult"/>); on success a `paused` event with reason "setip" follows.</summary>
+        public bool SetNextStatement(string module, int line)
+        {
+            return IsValidModuleName(module) && line > 0 && SendCommand("setip " + module + ":" + line);
         }
 
         /// <summary>Remove a breakpoint by module:line (planted or requested line both match).</summary>
@@ -461,11 +923,42 @@ namespace ClarionDebugger.Services
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
 
-        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
-        public bool RequestStack() { return SendCommand("stack"); }
+        /// <summary>The frame count every stack request names. It equals the engine's default
+        /// (STACK_FRAMES_DEFAULT; protocolcheck's CheckStackFrameCountSkew pins that at 32), so on a current
+        /// engine naming it changes nothing; it is sent so that the count, not the id, is the first
+        /// argument (97f23f5d).</summary>
+        internal const int StackFrameCount = 32;
 
-        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
-        public bool RequestModuleData() { return SendCommand("moduledata"); }
+        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived. A
+        /// <paramref name="reqId"/> (digits only) is sent as <c>reqid=N</c> and echoed on the reply, so the
+        /// host can tell which request a reply answers (49538b78 wave 5 run 3). The count always goes first:
+        /// an engine from before wave 5 reads the first argument as the count, so it refused <c>reqid=N</c>
+        /// there, and it ignores a trailing token. An older engine therefore still answers, without the id,
+        /// and that reply offers no frames: degraded, not dead (97f23f5d).</summary>
+        public bool RequestStack(string reqId = null)
+        {
+            string id = ReqIdSuffix(reqId);
+            return id != null && SendCommand("stack " + StackFrameCount.ToString(CultureInfo.InvariantCulture) + id);
+        }
+
+        /// <summary>The trailing <c> reqid=N</c> a read request ends with (stack, watch, moduledata), or "" for no
+        /// id; null when <paramref name="reqId"/> is not 1-10 digits, and the request is then not sent. The ONE
+        /// writer of the token, so the three requests cannot drift apart, and the same grammar the engine parses
+        /// (contract C1, 3517fd15): the LAST token, digits only, which also keeps it one word on the space-split
+        /// stdin.</summary>
+        internal static string ReqIdSuffix(string reqId)
+        {
+            if (reqId == null) return "";
+            return Regex.IsMatch(reqId, @"^[0-9]{1,10}\z") ? " reqid=" + reqId : null;
+        }
+
+        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived,
+        /// which echoes <paramref name="reqId"/> (sent as <c>reqid=N</c>) as the reply's reqId.</summary>
+        public bool RequestModuleData(string reqId = null)
+        {
+            string id = ReqIdSuffix(reqId);
+            return id != null && SendCommand("moduledata" + id);
+        }
 
         /// <summary>Request the thread inventory for the current stop (paused only); via ThreadsReceived.</summary>
         public bool RequestThreads() { return SendCommand("threads"); }
@@ -478,6 +971,10 @@ namespace ClarionDebugger.Services
         {
             return tid > 0 && SendCommand("thread " + tid.ToString(CultureInfo.InvariantCulture));
         }
+
+        /// <summary>Turn the engine's identify-thread-by-window mode on or off; answers via HoverChanged.
+        /// Valid running OR paused: the engine polls in both loops, and only reports while running.</summary>
+        public bool SetHover(bool on) { return SendCommand(on ? "hover on" : "hover off"); }
 
         /// <summary>Re-read the selected thread's registers (paused only); via RegsReceived. The 'paused'
         /// event carries the STOPPED thread's registers, so this is how the pane follows a thread switch.</summary>
@@ -509,8 +1006,39 @@ namespace ClarionDebugger.Services
             return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
         }
 
-        /// <summary>EXPERIMENT: request a disassembly listing at the current EIP (paused only);
-        /// result arrives via DisasmReceived.</summary>
+        /// <summary>Read <paramref name="len"/> bytes of the debuggee at <paramref name="addrHex"/> for the Memory
+        /// panel. Result arrives via MemReceived keyed by <paramref name="reqId"/>.
+        /// <para>
+        /// SECURITY. This is the one request that takes an address the page chose freely: the address box, and
+        /// "View memory" on any row. That freedom is the feature, so there is no table of issued addresses as
+        /// there is for edits and expands.
+        /// </para>
+        /// <para>
+        /// TRUST MODEL (Owner's decision, 2026-09-23, after the codex security gate raised "the page can drive
+        /// arbitrary mem reads" as a MEDIUM): our own packaged debugger.html is TRUSTED for memory reads. Typing
+        /// an address is the feature, and the user is debugging their own process.
+        ///  * WHO CAN ASK. OnWebMessage drops every message whose source is not our packaged page
+        ///    (IsExpectedSource, ClarionDebuggerWebView.cs), so the only in-page attacker left is an XSS in
+        ///    debugger.html itself.
+        ///  * WHAT THEY GET. READ-ONLY: `mem` has no write path, and a row's `addr` is a different member from
+        ///    the `va` the edit grants key on (EditGrants), so nothing read here can turn into a write.
+        ///    PAUSED-ONLY: the pad forwards it only while Paused, and the engine refuses it while running.
+        ///    CAPPED at 4096 bytes a request, here and again in the engine. VALIDATED here as
+        ///    ^0x[0-9A-Fa-f]{1,8}$ (WireRules.IsHexAddr, the same check MemRequest.Parse makes) plus an integer
+        ///    len, so nothing can add a word or a second command to the engine's space-separated stdin.
+        ///  * RESIDUAL RISK: an XSS in debugger.html could read the paused debuggee's memory, 4 KB at a time.
+        ///    That is tracked on the XSS audit ticket e1dea0d9, not closed here.
+        /// </para></summary>
+        public bool RequestMem(int reqId, string addrHex, int len)
+        {
+            if (reqId < 0 || len < 1 || len > WireRules.MemMaxLen) return false;
+            if (!WireRules.IsHexAddr(addrHex)) return false;
+            return SendCommand("mem " + addrHex + " " + len.ToString(CultureInfo.InvariantCulture) + " "
+                               + reqId.ToString(CultureInfo.InvariantCulture));
+        }
+
+        /// <summary>EXPERIMENT: request a disassembly listing at the SELECTED thread's EIP (paused only);
+        /// result arrives via DisasmReceived, stamped with the thread the engine decoded.</summary>
         public bool RequestDisasm() { return SendCommand("disasm"); }
 
         /// <summary>EXPERIMENT: request a disassembly window starting at a specific VA (hex like
@@ -518,6 +1046,12 @@ namespace ClarionDebugger.Services
         public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)
         {
             if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            // The tag is POSITIONAL: it occupies its own space-separated slot ahead of `before`. A tag
+            // containing whitespace would push `before` into the wrong argument and silently change the
+            // request — so it is validated HERE, in the writer every caller goes through, rather than left
+            // to each caller's own care. This was safe while every tag was a literal constant; it stopped
+            // being safe the moment the disassembly view began generating them (it appends an epoch).
+            if (tag != null && !Regex.IsMatch(tag, @"^[A-Za-z0-9_#.-]{0,32}$")) return false;
             // 'before' needs a tag slot ahead of it in the command; default to "win" so positions line up.
             string t = string.IsNullOrEmpty(tag) ? (before > 0 ? "win" : "") : tag;
             string cmd = "disasm " + vaHex + " " + count + (string.IsNullOrEmpty(t) ? "" : " " + t);
@@ -528,15 +1062,28 @@ namespace ClarionDebugger.Services
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
         /// BRW1::LastSortOrder, JOBS$JOB:RECORD). No spaces/newlines — the protocol is line/space-split.</summary>
+        /// <remarks>'!' separates a QUALIFIED name, <c>[image!][module!]name</c> (04d7b4c8), e.g.
+        /// <c>CLBRWS.EXE!CUS:RECORD</c>. It starts a comment in Clarion, so it is in no label, and it is not a
+        /// separator on the engine's line- and space-split stdin. Nothing else is added: no space, quote,
+        /// ';' or line break. The pattern ends in <c>\z</c>, not <c>$</c>: .NET's <c>$</c> also matches
+        /// before a trailing newline, which on that stdin is a second command. '@' is in the names the engine
+        /// itself prints for paste-back, e.g. <c>CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER</c>; it is no separator either.
+        /// '-' is in image file names, and so in a name qualified by one (<c>A-B.DLL!X</c>, 3517fd15): it is no
+        /// separator on that stdin either, and the engine suggests no qualified name outside this set.</remarks>
         public static bool IsValidWatchName(string name)
         {
             return !string.IsNullOrEmpty(name) && name.Length <= 128
-                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.]+$") && !name.Contains("..");
+                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!@-]+\z") && !name.Contains("..");
         }
 
         /// <summary>Watch a data symbol by name (global, file record buffer, or field). Resolves the
-        /// current thread's live value (incl. THREADed); result arrives via WatchReceived.</summary>
-        public bool Watch(string name) { return IsValidWatchName(name) && SendCommand("watch " + name); }
+        /// current thread's live value (incl. THREADed); result arrives via WatchReceived, echoing
+        /// <paramref name="reqId"/> (sent as <c>reqid=N</c>, after the name) as its ReqId.</summary>
+        public bool Watch(string name, string reqId = null)
+        {
+            string id = ReqIdSuffix(reqId);
+            return IsValidWatchName(name) && id != null && SendCommand("watch " + name + id);
+        }
 
         /// <summary>Edit-variable-value: write <paramref name="value"/> into the live variable at
         /// <paramref name="vaHex"/> (interpreted per <paramref name="typeCodeHex"/>/<paramref name="size"/>/
@@ -661,7 +1208,9 @@ namespace ClarionDebugger.Services
 
         // ------------------------------------------------------------------ event stream parsing
 
-        private void OnLine(string line)
+        /// <param name="source">The engine process that wrote this line. Only the "exited" arm needs it
+        /// today (as of 2026-09-22); it is passed for every line so no arm can reach for _proc instead.</param>
+        private void OnLine(Process source, string line)
         {
             if (!line.StartsWith("@JSON ", StringComparison.Ordinal))
             {
@@ -714,6 +1263,8 @@ namespace ClarionDebugger.Services
                         pause.ResolvedPath = ResolveModulePath(pause.Module);
                         CurrentVa = pause.Va;
                         SetState(DebugSessionState.Paused);
+                        // A stop resets the engine's selection to the stopped thread.
+                        MoveSelection(pause.Tid, pause.Tid, ThreadSelectionCause.Stop, false);
                         Paused?.Invoke(pause);
                     }
                     break;
@@ -728,11 +1279,19 @@ namespace ClarionDebugger.Services
                     var bp = ParseBpFields(json, GetStr(json, "module"));
                     lock (_breakpoints)
                     {
+                        // Identity is the line the USER asked for, not the record the engine snapped to:
+                        // two gutter lines can snap to one planted line and they are two breakpoints, not
+                        // one. Keying this on Line collapsed them into a single pane row.
                         DebugBreakpoint known = null;
                         foreach (var b in _breakpoints)
-                            if (b.Module == bp.Module && b.Line == bp.Line) { known = b; break; }
+                            if (SameBpIdentity(b, bp)) { known = b; break; }
                         if (known == null) _breakpoints.Add(bp);
-                        else CopyBpProps(bp, known);   // refresh props/hit count on a re-confirm (properties edit)
+                        else
+                        {
+                            known.Line = bp.Line;      // a re-plant can snap the same requested line elsewhere
+                            LearnBpOwner(known, bp);   // a row that had no owner takes the one the engine just named
+                            CopyBpProps(bp, known);    // refresh props/hit count on a re-confirm (properties edit)
+                        }
                     }
                     BreakpointSet?.Invoke(bp);
                     break;
@@ -740,9 +1299,18 @@ namespace ClarionDebugger.Services
                 case "bp-del":
                     string delMod = GetStr(json, "module");
                     int delLine = GetInt(json, "line");
+                    // The engine removed exactly ONE logical breakpoint and names it by its requested line.
+                    // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
+                    // requested line for an unresolved raw breakpoint.
+                    int? delRequested = GetIntOrNull(json, "requestedLine");
+                    // ...and by its owning image, for the same reason: `module` is a basename, so a bp-del
+                    // that named only (module, requestedLine) would remove the same-named breakpoint in
+                    // EVERY loaded DLL. Absent (an engine that predates ownerPath) matches any owner, which
+                    // is exactly today's behaviour — see BpOwnerMatches.
+                    string delOwner = GetStr(json, "ownerPath");
                     lock (_breakpoints)
-                        _breakpoints.RemoveAll(b => b.Module == delMod && b.Line == delLine);
-                    BreakpointRemoved?.Invoke(delMod, delLine);
+                        _breakpoints.RemoveAll(b => BpDelMatches(b, delMod, delRequested, delLine, delOwner));
+                    BreakpointRemoved?.Invoke(delMod, delRequested ?? delLine);
                     break;
 
                 case "bp-error":
@@ -775,17 +1343,21 @@ namespace ClarionDebugger.Services
                         if (!dpaths.TryGetValue(di.Module, out rp)) { rp = ResolveModulePath(di.Module); dpaths[di.Module] = rp; }
                         di.ResolvedPath = rp;
                     }
-                    DisasmReceived?.Invoke(GetStr(json, "tag"), dlist);
+                    // Same absent-aware reader every other thread-scoped reply uses: an engine that does not
+                    // stamp disasm yields null, which means UNKNOWN — never 0, which a consumer would read
+                    // as a real thread.
+                    DisasmReceived?.Invoke(GetStr(json, "tag"), dlist, GetUIntOrNull(json, "tid"));
                     break;
 
                 case "stack":
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
-                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"));
+                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"), GetStr(json, "reqId"));
                     break;
 
                 case "moduledata":
-                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"),
+                                               GetStr(json, "reqId"));
                     break;
 
                 case "expanded":
@@ -800,16 +1372,35 @@ namespace ClarionDebugger.Services
                     LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
                     break;
 
+                case "mem":
+                    MemReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "addr"), GetInt(json, "len"), GetInt(json, "read"), GetStr(json, "bytes"), GetStr(json, "error"));
+                    break;
+
                 case "threads":
                     var tl = ParseThreads(json);
-                    if (tl != null) ThreadsReceived?.Invoke(tl);
+                    if (tl != null)
+                    {
+                        // The engine's own answer; it moves the selection only where it differs from ours.
+                        MoveSelection(InventorySelection(tl), tl.StoppedTid, ThreadSelectionCause.Inventory, true);
+                        ThreadsReceived?.Invoke(tl);
+                    }
                     break;
 
                 case "threadselected":
                     // The tid is the thread that was ASKED FOR, and a malformed request carries none at all
                     // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
                     // as a real thread id. Absent is the only way to say "unknown".
-                    ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
+                    uint? selTid = GetUIntOrNull(json, "tid");
+                    bool selOk = GetBool(json, "ok");
+                    // Only an accepted switch to a real thread moves it; a refusal leaves the engine's unchanged.
+                    if (selOk && WireRules.TidIsKnown(selTid))
+                        MoveSelection(selTid, null, ThreadSelectionCause.Switch, false);   // stopped: kept under the lock
+                    ThreadSelected?.Invoke(selTid, selOk, GetStr(json, "error"));
+                    break;
+
+                case "hover":
+                    // The thread under the cursor. Absent means NONE and stays null, never 0.
+                    HoverChanged?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "on"), GetBool(json, "paused"));
                     break;
 
                 case "watch":
@@ -836,9 +1427,31 @@ namespace ClarionDebugger.Services
                     EngineError?.Invoke(GetStr(json, "message"));
                     break;
 
+                case "setip":   // set next statement: a refusal, or the success that precedes `paused` reason setip
+                    SetIpResult?.Invoke(GetBool(json, "ok"), GetStr(json, "reason"), GetStr(json, "module"),
+                                        GetInt(json, "line"), GetStr(json, "error"));
+                    break;
+
                 case "exited":
-                    CurrentVa = null;
-                    SetState(DebugSessionState.Idle);
+                    OnEngineReportedExit(source);
+                    break;
+
+                // An ATTACHED session let its process go (3f2d747f); the app keeps running and the engine exits
+                // next. The session is over at once, exactly as for "exited", and the engine is reaped the same
+                // way: after a detach a kill leaves no planted byte behind, because the detach already restored them.
+                case "detached":
+                    if (ReferenceEquals(source, _proc))
+                    {
+                        var d = ParseDetached(json, _attachTarget);
+                        OnEngineReportedExit(source);
+                        Detached?.Invoke(d);
+                    }
+                    else
+                    {
+                        // An OLDER engine's line, read after a new session began: it must not end the new one.
+                        OnEngineReportedExit(source);
+                        LogReceived?.Invoke("a previous session's engine detached from pid " + GetUIntOrNull(json, "pid"));
+                    }
                     break;
 
                 default:
@@ -980,11 +1593,15 @@ namespace ClarionDebugger.Services
         /// — flat unique keys, extracted directly. Null when the event carries no register block.</summary>
         private static Dictionary<string, string> ParseRegs(string json)
         {
-            if (string.IsNullOrEmpty(json) || json.IndexOf("\"regs\":{", StringComparison.Ordinal) < 0) return null;
+            int at = string.IsNullOrEmpty(json) ? -1 : json.IndexOf("\"regs\":{", StringComparison.Ordinal);
+            if (at < 0) return null;
+            // GetStr reads members of the object it is handed, so it is handed the register block itself -
+            // from its opening brace; the reader stops at the matching close.
+            string block = json.Substring(at + "\"regs\":".Length);
             var regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var reg in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" })
             {
-                string v = GetStr(json, reg);
+                string v = GetStr(block, reg);
                 if (v != null) regs[reg] = v;
             }
             return regs;
@@ -999,15 +1616,22 @@ namespace ClarionDebugger.Services
                 var list = new DebugThreadList();
                 int arr = json.IndexOf("\"threads\":[", StringComparison.Ordinal);
                 string head = arr > 0 ? json.Substring(0, arr) : json;
-                list.StoppedTid = GetUIntOrNull(head, "stopped") ?? 0u;
-                list.SelectedTid = GetUIntOrNull(head, "selected") ?? 0u;
+                // No "?? 0u": these are thread-id-valued members whatever they are called, so the
+                // absent-means-unknown rule is theirs too. An engine that predates 3b043dfc writes them
+                // unconditionally and a known id still reads as itself, so nothing here changes for it.
+                list.StoppedTid = GetUIntOrNull(head, "stopped");
+                list.SelectedTid = GetUIntOrNull(head, "selected");
                 foreach (Match m in Regex.Matches(ExtractArrayBalanced(json, "threads"), "\\{[^{}]*\\}"))
                 {
                     string t = m.Value;
-                    if (!t.Contains("\"tid\":")) continue;
+                    // A row is a thread only if it names one. This used to test for the TEXT "tid": and then
+                    // read the number with `?? 0u`, so a row whose tid did not parse became thread 0 - the
+                    // sentinel the absent-tid rule exists to keep off the wire (c299aced).
+                    uint? rowTid = GetUIntOrNull(t, "tid");
+                    if (!WireRules.TidIsKnown(rowTid)) continue;
                     list.Threads.Add(new DebugThread
                     {
-                        Tid = GetUIntOrNull(t, "tid") ?? 0u,
+                        Tid = rowTid.Value,
                         ClarionThread = GetIntOrNull(t, "clarionThread"),
                         Proc = GetStr(t, "proc"),
                         Module = GetStr(t, "module"),
@@ -1114,6 +1738,8 @@ namespace ClarionDebugger.Services
                 // pad has stopped showing must be dropped just as firmly as a hit, or a late "(not found)"
                 // from the previous thread wipes a row that the new thread answered correctly.
                 w.Tid = GetUIntOrNull(json, "tid");
+                // The request it answers, on both outcomes: a miss answers its request as surely as a hit does.
+                w.ReqId = GetStr(json, "reqId");
                 if (!w.Found)
                 {
                     w.OutOfScope = GetBool(json, "outOfScope");
@@ -1127,12 +1753,116 @@ namespace ClarionDebugger.Services
                 w.TypeCode = GetStr(json, "type");   // raw code as hex ("0x11") for edit-variable-value
                 w.Size = GetInt(json, "size");
                 w.Places = GetInt(json, "places");   // 0 when absent (watch doesn't carry DECIMAL scale)
+                // Absent, not zero/empty, when the engine does not send them: addr only for own storage,
+                // frameIdx/frameProc only for a local resolved outside frame 0 (04b9679e).
+                w.Addr = GetStr(json, "addr");
+                w.FrameIdx = GetIntOrNull(json, "frameIdx");
+                w.FrameProc = GetStr(json, "frameProc");
                 // Value is now formatted engine-side by the shared Clarion value renderer (same one the
                 // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
                 w.Value = GetStr(json, "value");
                 return w;
             }
             catch { return null; }
+        }
+
+        /// <summary>The engine's <c>detached</c> event, named from <paramref name="target"/> (the event carries only
+        /// the pid). <c>error</c> is present only when a breakpoint byte could not be restored.</summary>
+        internal static DebugDetach ParseDetached(string json, AttachableProcess target)
+        {
+            return new DebugDetach
+            {
+                Pid = GetUIntOrNull(json, "pid"),
+                Name = target != null ? target.Name : null,
+                Drained = GetInt(json, "drained"),
+                Restored = GetIntOrNull(json, "restored") ?? -1,   // a count, not a bool (Json.Detached)
+                Error = GetStr(json, "error")
+            };
+        }
+
+        /// <summary>At most this many processes are taken from one listing: the picker is a list a person reads.</summary>
+        internal const int MaxListedProcesses = 1000;
+
+        /// <summary>
+        /// The attach picker's list (3f2d747f): the processes the engine's one-shot <c>procs --json</c> reports as
+        /// attachable - x86, carrying TSWD debug info, not already debugged - with <paramref name="excludePid"/>
+        /// (the IDE itself) left out. Null with <paramref name="error"/> set when the listing could not be read.
+        /// BLOCKS for up to about 15 s: call it off the UI thread.
+        /// </summary>
+        public static List<AttachableProcess> ListProcesses(int excludePid, out string error)
+        {
+            error = null;
+            try
+            {
+                string engine = FindEngine();
+                if (engine == null) { error = "ClarionDbg.exe not found"; return null; }
+                var psi = new ProcessStartInfo(engine, "procs --json --exclude " + excludePid.ToString(CultureInfo.InvariantCulture))
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    WorkingDirectory = Path.GetDirectoryName(engine)
+                };
+                using (var p = Process.Start(psi))
+                {
+                    // Both pipes read on workers, and the wait bounded: a wedged child costs a timeout, never the caller.
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(15000))
+                    {
+                        try { p.Kill(); } catch { }
+                        error = "the process list did not arrive within 15 s";
+                        return null;
+                    }
+                    if (!outTask.Wait(2000)) { error = "the process list could not be read"; return null; }
+                    try { errTask.Wait(500); } catch { }
+                    var list = ParseProcsJson(outTask.Result);
+                    if (list == null)
+                        error = "the engine sent no process list" + (p.ExitCode != 0 ? " (exit " + p.ExitCode + ")" : "");
+                    return list;
+                }
+            }
+            catch (Exception ex) { error = ex.Message; return null; }
+        }
+
+        /// <summary>The processes in the engine's <c>{"event":"procs","procs":[...]}</c> line, or null when there
+        /// is no such line or it is not well-formed. An entry without a positive pid is dropped, and at most
+        /// <see cref="MaxListedProcesses"/> are kept. Names and paths are the process's own and so UNTRUSTED text:
+        /// the page renders them as text only.</summary>
+        internal static List<AttachableProcess> ParseProcsJson(string stdout)
+        {
+            if (string.IsNullOrEmpty(stdout)) return null;
+            foreach (var raw in stdout.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (!line.StartsWith("{", StringComparison.Ordinal) || JsonMessageReader.ReadStringField(line, "event") != "procs") continue;
+                var list = new List<AttachableProcess>();
+                // Innermost first, so the entries come before the envelope, which has no pid and is skipped.
+                bool ok = JsonMessageReader.ForEachObject(line, o =>
+                {
+                    uint pid;
+                    if (list.Count >= MaxListedProcesses) return;
+                    if (!WireRules.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
+                    // A listed entry carries "tswd"; a --verbose SKIP entry ({pid,name,reason}) does not, and must
+                    // never become an attachable process.
+                    string tswd = JsonMessageReader.ReadField(o, "tswd");
+                    if (tswd == null) return;
+                    list.Add(new AttachableProcess
+                    {
+                        Pid = pid,
+                        Name = JsonMessageReader.ReadStringField(o, "name"),
+                        Path = JsonMessageReader.ReadStringField(o, "path"),
+                        Tswd = tswd == "true",
+                        // Creation FILETIME as a decimal string (additive; an older engine omits it). Anything that is
+                        // not plain digits is dropped, and the attach is then refused rather than made blind.
+                        Started = AttachableProcess.IsStartTime(JsonMessageReader.ReadStringField(o, "started"))
+                            ? JsonMessageReader.ReadStringField(o, "started") : null
+                    });
+                });
+                return ok ? list : null;
+            }
+            return null;
         }
 
         /// <summary>Synchronously query the EXE's static data symbols (globals + file record buffers
@@ -1224,22 +1954,32 @@ namespace ClarionDebugger.Services
                 foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
                 {
                     if (list.Count >= MaxProcedures) break;
-                    string obj = m.Value;
-                    string kind = GetStr(obj, "kind");
-                    // Routines come through as well as procedures/methods: they are what lets a breakpoint
-                    // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
-                    // them together with their parent by definition line, so containment falls out of the
-                    // line order — no extra symbol work. The Procedures panel filters routines back out on
-                    // the client, so this does not change what that list shows.
-                    if (kind != "procedure" && kind != "method" && kind != "routine") continue;
-                    int line = GetInt(obj, "line");
-                    if (line <= 0) continue;
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind });
+                    var p = ProcedureFromSymbol(m.Value);
+                    if (p != null) list.Add(p);
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }
             catch { }
             return list;
+        }
+
+        /// <summary>One <c>@SYMBOLS</c> row as a listed procedure, or null for a row the list skips (another kind,
+        /// or no definition line).</summary>
+        internal static DebugProcedure ProcedureFromSymbol(string obj)
+        {
+            string kind = GetStr(obj, "kind");
+            // Routines come through as well as procedures/methods: they are what lets a breakpoint
+            // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
+            // them together with their parent by definition line, so containment falls out of the
+            // line order — no extra symbol work. The Procedures panel filters routines back out on
+            // the client, so this does not change what that list shows.
+            if (kind != "procedure" && kind != "method" && kind != "routine") return null;
+            int line = GetInt(obj, "line");
+            if (line <= 0) return null;
+            int? end = GetIntOrNull(obj, "endLine");
+            return new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
+                                        EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0,
+                                        ExtentUnknown = GetStr(obj, "extent") == "unknown" };
         }
 
         private static List<DebugBreakpoint> ParseBpList(string json)
@@ -1265,14 +2005,27 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>Build a breakpoint (location + advanced properties) from a single bp-set / bp-list
-        /// JSON object. Shared so bp-set and bp-list decode identically.</summary>
+        /// JSON object. Shared so bp-set and bp-list decode identically — which is also why the
+        /// absent-vs-zero care below only has to be taken once: this is the single place either event's
+        /// <c>requestedLine</c> is read, so no caller can bypass it.
+        /// <para>
+        /// GetIntOrNull, not GetInt, for the same reason the bp-del arm uses it: GetInt answers 0 for an
+        /// absent field, and 0 is a real requested line. Against an engine build that omits
+        /// <c>requestedLine</c>, GetInt gave every breakpoint in a module an identity of (module, 0) and
+        /// SameBpIdentity merged them into one pane row.
+        /// </para></summary>
         private static DebugBreakpoint ParseBpFields(string json, string module)
         {
             return new DebugBreakpoint
             {
                 Module = module,
                 Line = GetInt(json, "line"),
-                RequestedLine = GetInt(json, "requestedLine"),
+                RequestedLineOrNull = GetIntOrNull(json, "requestedLine"),
+                // The other half of the identity key, and the same absent-is-not-a-value care. GetStr
+                // answers null for an absent member AND for a JSON null, which here mean the same thing:
+                // this echo does not name an owning image. BpOwnerMatches then lets it match any owner,
+                // so an engine that predates the field keeps today's behaviour exactly.
+                OwnerPath = GetStr(json, "ownerPath"),
                 Condition = GetStr(json, "condition"),
                 HitMode = GetStr(json, "hitMode"),
                 HitValue = GetInt(json, "hitValue"),
@@ -1281,8 +2034,150 @@ namespace ClarionDebugger.Services
             };
         }
 
+        /// <summary>Whether a bp-set echo names a breakpoint the host already lists. Identity is
+        /// (owning image, module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
+        /// two distinct gutter lines can snap to the same record, so keying identity on it merges two
+        /// breakpoints into one row and loses one of them.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one. When either is absent — an engine
+        /// build older than that protocol change, which reports no <c>requestedLine</c> — this falls back to
+        /// the planted line, exactly as <see cref="BpDelMatches"/> does and for the same reason: an old
+        /// engine cannot say which of two gutter lines that snapped to one record it means, so the planted
+        /// line is all there is to key on. That fallback still merges two breakpoints sharing a record, which
+        /// is the pre-existing cost of talking to an old engine; what it does NOT do is merge every
+        /// breakpoint in the module, which is what comparing an absent line as 0 did.
+        /// </para>
+        /// <para>
+        /// Both sides come from the same engine build in a live session, so both-present and both-absent are
+        /// the reachable cases; the mixed case is defined rather than left to a 0 default, and is asserted in
+        /// tools/test-addin-json.ps1 against a present requested line of 0.
+        /// </para>
+        /// <para>
+        /// The module is a BASENAME, so <see cref="BpOwnerMatches"/> carries the other half: two loaded DLLs
+        /// can each hold a <c>clbrws011.clw</c>, and without the owning image those two breakpoints have one
+        /// identity and merge into a single pane row (task e80072f1).
+        /// </para>
+        /// <para>
+        /// Both halves are SHARED BODIES, not mirrored ones. This and <see cref="BpDelMatches"/> reach the
+        /// same answer because they run the same two functions, so neither can be edited out of step with
+        /// the other; tools/test-addin-json.ps1 asserts they agree over an enumerated input space as well.
+        /// </para></summary>
+        internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)
+        {
+            if (a.Module != b.Module) return false;
+            if (!BpOwnerMatches(a.OwnerPath, b.OwnerPath)) return false;
+            return BpLineMatches(a, b.RequestedLineOrNull, b.Line);
+        }
+
+        /// <summary>The LINE half of breakpoint identity, and the ONLY copy of it. Both
+        /// <see cref="SameBpIdentity"/> and <see cref="BpDelMatches"/> call this, so the question "do the
+        /// two predicates still agree?" is no longer a claim about two bodies that happen to read alike —
+        /// there is one body. They were structurally identical by review before, which is a property a
+        /// later edit to either one silently ends.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one. When either is absent — an engine
+        /// build older than that protocol change — this falls back to the planted line, which can match
+        /// several breakpoints that snapped to one record. That is the documented cost of talking to an old
+        /// engine, and it beats comparing an absent line as 0, which merged every breakpoint in a module.
+        /// </para></summary>
+        internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)
+        {
+            int? rb = b.RequestedLineOrNull;
+            return (requestedLine.HasValue && rb.HasValue) ? rb.Value == requestedLine.Value
+                                                           : b.Line == plantedLine;
+        }
+
+        /// <summary>The OWNER half of breakpoint identity, and likewise the only copy. A breakpoint's
+        /// <c>module</c> is a bare .clw basename, so two loaded DLLs that each carry a same-named compiland
+        /// produce two breakpoints with one identity; the owning image is what tells them apart.
+        /// <para>
+        /// UNKNOWN MATCHES ANYTHING, deliberately. An owner of null means the sender did not say — an
+        /// engine that predates the <c>ownerPath</c> field, a still-pending breakpoint whose image has not
+        /// mapped, or a host-built gutter entry, which never knows the image at all. Treating unknown as a
+        /// distinct owner would make a new host stop matching an old engine's echoes entirely, i.e. turn a
+        /// missing disambiguator into a total failure to remove or dedupe anything. Falling back to
+        /// today's (module, line) behaviour is the same trade every other absent field here makes.
+        /// </para>
+        /// <para>
+        /// OrdinalIgnoreCase: these are Windows image paths, which are case-insensitive, and the two sides
+        /// can come from different engine sessions via a stale host entry.
+        /// </para></summary>
+        internal static bool BpOwnerMatches(string a, string b)
+        {
+            return a == null || b == null || string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Which host entries one bp-del removes. The engine deletes exactly one logical
+        /// breakpoint and names it by <c>requestedLine</c>, so this matches that one and leaves any
+        /// neighbour sharing its planted line alone. Only when the echo carries NO requestedLine — an
+        /// engine build older than this protocol change — does it fall back to the planted line, which
+        /// can still match several: that is the old behaviour, kept deliberately so an old engine keeps
+        /// deleting something rather than silently deleting nothing.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one, exactly as in
+        /// <see cref="SameBpIdentity"/>, which was written to mirror this function. Reading the entry's line
+        /// through the substituting getter (then <c>RequestedLine</c>, now <c>DisplayLine</c>) instead
+        /// compared the entry's PLANTED line against the echo's REQUESTED one whenever the entry came from an engine build that reports no
+        /// <c>requestedLine</c> — which both removes a row the engine did not delete (the two lines happen to
+        /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
+        /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
+        /// over-broad, and the documented cost of an old echo, rather than silently wrong.
+        /// </para>
+        /// <para>
+        /// <paramref name="ownerPath"/> is the owning image the echo names, or null when it names none. It is
+        /// on bp-del for the same reason it is on bp-set: <paramref name="module"/> is a basename, so without
+        /// it one delete would take the same-named breakpoint out of every loaded DLL. Null matches any
+        /// owner — see <see cref="BpOwnerMatches"/> — so an engine that predates the field behaves as before.
+        /// </para></summary>
+        internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine, string ownerPath)
+        {
+            if (b.Module != module) return false;
+            if (!BpOwnerMatches(b.OwnerPath, ownerPath)) return false;
+            return BpLineMatches(b, requestedLine, plantedLine);
+        }
+
+        /// <summary>Teach an existing row the owning image the engine has just named, when it did not have
+        /// one. THE ROW'S OWNER IS LEARNED ONCE AND NEVER UNLEARNED.
+        /// <para>
+        /// A null <see cref="DebugBreakpoint.OwnerPath"/> means "unknown", and
+        /// <see cref="BpOwnerMatches"/> deliberately lets unknown match ANY owner so an engine that
+        /// predates the field keeps working. That fallback is correct for a row that has never been told
+        /// an owner, and WRONG the moment it has: a breakpoint starts pending (the engine emits
+        /// <c>ownerPath</c> null because no image carries its compiland yet), and if the row kept that null
+        /// after the engine armed it and said where, the row would stay a PERMANENT WILDCARD. It would then
+        /// match every later bp-set for that module and requested line - so two images collapse into one
+        /// pane row - and every bp-del, so a removal in one image takes the other one's row with it. The
+        /// disambiguator would have been supplied by the engine and thrown away on arrival.
+        /// </para>
+        /// <para>
+        /// ONLY null -> value. The reverse would re-open the wildcard, and value -> different value cannot
+        /// occur, because <see cref="SameBpIdentity"/> would not have matched two rows with different known
+        /// owners in the first place. So the only reachable case is the one this fixes.
+        /// </para>
+        /// <para>
+        /// RAW WIRE TEXT IS COMPARED, AND THAT IS SUFFICIENT HERE RATHER THAN LUCKY - stating it because
+        /// nothing else in the file says so. <c>GetStr</c> returns the raw JSON text without unescaping, so
+        /// a Windows separator reads back doubled (<c>C:\\App\\x.dll</c>). Every OwnerPath in this list
+        /// arrives through that one reader from the engine's own <c>Json.Str</c> output, so both sides of
+        /// every comparison carry identical escaping; and a Windows path cannot contain a quote, so
+        /// GetStr's stop-at-quote capture cannot truncate one. WHAT WOULD BREAK IT: any future path that
+        /// sets OwnerPath from a NON-WIRE source - a host-derived project path (dd35dd7e) is exactly that -
+        /// since it would hold an unescaped spelling that compares unequal to the engine's. That must be
+        /// canonicalized where the mapping is built, not smoothed over by loosening the comparison here.
+        /// </para></summary>
+        private static void LearnBpOwner(DebugBreakpoint known, DebugBreakpoint echo)
+        {
+            if (known.OwnerPath == null && echo.OwnerPath != null) known.OwnerPath = echo.OwnerPath;
+        }
+
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an
-        /// existing list entry (a re-confirmed bp-set is how a properties edit reaches the host).</summary>
+        /// existing list entry (a re-confirmed bp-set is how a properties edit reaches the host).
+        /// <para>
+        /// LOCATION AND IDENTITY ARE NOT PROPERTIES and are deliberately not copied here: the planted line
+        /// is assigned by the caller, and the owning image goes through <see cref="LearnBpOwner"/>, which
+        /// is monotonic. Adding OwnerPath to this list instead would let a later echo overwrite a known
+        /// owner with null and silently restore the wildcard this pair exists to prevent.
+        /// </para></summary>
         private static void CopyBpProps(DebugBreakpoint from, DebugBreakpoint to)
         {
             to.Condition = from.Condition;
@@ -1298,7 +2193,12 @@ namespace ClarionDebugger.Services
         public static string BuildBpSpec(DebugBreakpoint bp)
         {
             var sb = new System.Text.StringBuilder();
-            sb.Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+            // DisplayLine already falls back to the planted line when no requested line exists, which is what
+            // the `RequestedLine > 0 ? RequestedLine : Line` here used to spell out a second time (f367a04f).
+            // The two differ only for a PRESENT requested line of 0 - an unresolved raw breakpoint's echo -
+            // and none reaches this method: as of 2026-09-22 its callers pass the pad's staged entries, which
+            // are host-built with Line equal to the requested line.
+            sb.Append(bp.Module).Append(':').Append(bp.DisplayLine);
             if (!string.IsNullOrEmpty(bp.Condition)) sb.Append("|c=").Append(B64(bp.Condition));
             if (bp.HitMode == "eq" || bp.HitMode == "gte" || bp.HitMode == "mod")
                 sb.Append("|hm=").Append(bp.HitMode).Append("|hv=").Append(bp.HitValue);
@@ -1316,10 +2216,28 @@ namespace ClarionDebugger.Services
             return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : 0;
         }
 
+        /// <summary>A string member of THIS object, UNESCAPED, or null when it is absent, not a string, or
+        /// the text is not a well-formed object.
+        /// <para>
+        /// This was a regex returning the raw text between the quotes, so a path arrived with its separators
+        /// still doubled and was escaped a second time on its way to the page (079ff431); it also stopped
+        /// at the first quote, cutting short any value with an escaped one in it, and matched the key
+        /// ANYWHERE in the text. It now goes through the bridge's real reader.
+        /// </para>
+        /// <para>
+        /// THE CALLER AUDIT (2026-09-22), because both changes - unescaping, and top-level only - can move a
+        /// caller that leaned on the old behaviour:
+        /// every event handler in <see cref="OnLine"/> and the flat objects cut out by ParseStack /
+        /// ParseThreads / ParseDisasm / GetProcedures read members of the object they were handed; the
+        /// ParseBpList chunks each start at their own object's brace, and the reader stops at its end. The
+        /// one caller that read a NESTED member was ParseRegs (the registers sit inside <c>"regs":{...}</c>),
+        /// and it now hands over that object instead of the event. The one caller that compared RAW text
+        /// was the breakpoint owner (OwnerPath): it is only ever compared with another value read here,
+        /// so both sides moved together and the comparison is unchanged.
+        /// </para></summary>
         private static string GetStr(string json, string key)
         {
-            var m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-            return m.Success ? m.Groups[1].Value : null;
+            return JsonMessageReader.ReadStringField(json, key);
         }
         private static int GetInt(string json, string key)
         {
