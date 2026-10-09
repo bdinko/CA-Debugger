@@ -23,7 +23,10 @@ namespace ClarionDbg.Cli
                          + "path and PE; one DLL named in two spellings preloads once; a DLL mapping from a preloaded path "
                          + "claims that entry, a same-build copy from another directory claims the one matching preload, and "
                          + "two matching preloads, only a different build of the name, another name's same build or an unread link time "
-                         + "claim nothing (a new entry).");
+                         + "claim nothing (a new entry); a readable copy with the same link time and size but different debug data "
+                         + "claims nothing, nor does a readable file whose link time is not the mapped header's, and an unreadable one claims only when its mapped header's link time, size, checksum and "
+                         + "debug entry (type, link time, data size) all read and match, so a header with no size never matches a "
+                         + "preload of the old 0x10000 floor, and two copies with empty debug data are not one build (fb5766d1 #2).");
 
             string root = Path.Combine(Path.GetTempPath(), "cadbg-samename-" + Guid.NewGuid().ToString("N"));
             try
@@ -58,9 +61,18 @@ namespace ClarionDbg.Cli
                 if (ea.Pe == null || eb.Pe == null || ea.Pe.TimeDateStamp != 0x11111111 || eb.Pe.TimeDateStamp != 0x22222222)
                     failures.Add("same-name dlls: the two entries do not each carry their own file's PE");
 
+                PeImage.DebugEntry fixtureDbg;
+                if (!ea.Pe.TryReadFirstDebugEntry(out fixtureDbg) || fixtureDbg.SizeOfData == 0)
+                { failures.Add("same-name dlls: fixture precondition - ClarionDbg.Core.dll has no debug entry, so no build identity can be tested"); return; }
+
                 var table = eng.ModulesForTest();
+                // A READABLE mapped file: its own PE is what ClaimUnmapped compares, mapped with link time `stamp`.
                 Func<string, uint, LoadedModule> claim = (path, stamp) =>
-                    DebugEngine.ClaimUnmapped(table, DebugEngine.CanonicalImagePath(path), "shared.dll", stamp, ea.Pe.SizeOfImage);
+                {
+                    var disk = PeImage.Load(path);
+                    var mb = new DebugEngine.MappedBuild { DiskPe = disk, Stamp = stamp, Size = disk.SizeOfImage };
+                    return DebugEngine.ClaimUnmapped(table, DebugEngine.CanonicalImagePath(path), "shared.dll", mb);
+                };
 
                 if (claim(bPath, 0x22222222) != eb) failures.Add("same-name dlls: B mapping from its own path did not claim B's entry");
                 if (claim(a, 0x11111111) != ea) failures.Add("same-name dlls: A mapping from its own path did not claim A's entry");
@@ -69,6 +81,87 @@ namespace ClarionDbg.Cli
                 if (claim(copyOfA, 0x11111111) != ea) failures.Add("same-name dlls: a same-build copy of A from another directory did not claim A's entry");
                 if (claim(copyOfA, 0x44444444) != null) failures.Add("same-name dlls: a DIFFERENT build of shared.dll from another directory claimed an entry");
                 if (claim(copyOfA, 0) != null) failures.Add("same-name dlls: an unreadable mapped header (link time 0) claimed an entry");
+
+                // fb5766d1 #2, READABLE: the same link time and size, one byte of debug data different, is another build.
+                byte[] aBytes = File.ReadAllBytes(a);
+                var aPe = new PeImage(aBytes);
+                int dbgEntryOff = (int)aPe.RvaToOffset(aPe.DebugDirRva);
+                int peHdr = BitConverter.ToInt32(aBytes, 0x3C), optHdr = peHdr + 24;
+                Func<string, Action<byte[]>, string> writeVariant = (dir, patch) =>
+                {
+                    var b = (byte[])aBytes.Clone();
+                    patch(b);
+                    string d = Path.Combine(root, dir);
+                    Directory.CreateDirectory(d);
+                    string f = Path.Combine(d, "shared.dll");
+                    File.WriteAllBytes(f, b);
+                    return f;
+                };
+                string otherDebug = writeVariant("OtherDebug", b => b[fixtureDbg.PointerToRawData + fixtureDbg.SizeOfData / 2] ^= 0xFF);
+                if (claim(otherDebug, 0x11111111) != null)
+                    failures.Add("same-name dlls: a readable copy whose debug data differs (same link time and size) claimed A's entry");
+                // The file on disk must be the build that mapped: B's file (same debug data, its own link time) read at a
+                // path whose MAPPED header says A's link time is a file replaced since, and proves nothing about A.
+                var bDisk = PeImage.Load(bPath);
+                if (DebugEngine.ClaimUnmapped(table, Path.Combine(root, "Replaced", "shared.dll"), "shared.dll",
+                        new DebugEngine.MappedBuild { DiskPe = bDisk, Stamp = 0x11111111, Size = bDisk.SizeOfImage }) != null)
+                    failures.Add("same-name dlls: a readable file whose link time is not the mapped header's claimed A's entry");
+
+                // UNREADABLE: the mapped header alone (DiskPe null), read through the REAL ReadMappedBuild over the bytes,
+                // laid out by A's section table, so a patched header field is the only difference.
+                Func<byte[], LoadedModule> claimHeader = bytes =>
+                    DebugEngine.ClaimUnmapped(table, Path.Combine(root, "Gone", "shared.dll"), "shared.dll",
+                                              DebugEngine.ReadMappedBuild(FileAsMapped(bytes, aPe), null));
+                Func<Action<byte[]>, byte[]> variant = patch => { var b = (byte[])aBytes.Clone(); patch(b); return b; };
+                if (claimHeader(aBytes) != ea)
+                    failures.Add("same-name dlls (control): an unreadable copy whose mapped header matches A in every field did not claim A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(0x1234u).CopyTo(b, optHdr + 64))) != null)
+                    failures.Add("same-name dlls: an unreadable copy with a different PE checksum claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(0x7777u).CopyTo(b, dbgEntryOff + 4))) != null)
+                    failures.Add("same-name dlls: an unreadable copy whose debug entry has a different link time claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(fixtureDbg.SizeOfData + 1).CopyTo(b, dbgEntryOff + 16))) != null)
+                    failures.Add("same-name dlls: an unreadable copy whose debug entry has a different data size claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(fixtureDbg.Type ^ 0x100u).CopyTo(b, dbgEntryOff + 12))) != null)
+                    failures.Add("same-name dlls: an unreadable copy whose debug entry has a different type claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(0u).CopyTo(b, optHdr + 96 + 6 * 8 + 4))) != null)
+                    failures.Add("same-name dlls: an unreadable copy with no debug directory claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(0u).CopyTo(b, peHdr))) != null)
+                    failures.Add("same-name dlls: an unreadable copy with no PE signature claimed A's entry");
+
+                // The old size reader answered 0x10000 for a header whose SizeOfImage reads 0, and a preload of that
+                // size then matched. The identity read must say 0, and 0 matches nothing.
+                var fabPath = writeAs("Fab", 0x66666666, "fab.dll");
+                byte[] fab = File.ReadAllBytes(fabPath);
+                BitConverter.GetBytes(0x10000u).CopyTo(fab, optHdr + 56);
+                File.WriteAllBytes(fabPath, fab);
+                var fabEng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false, new[] { fabPath });
+                var fabTable = fabEng.ModulesForTest();
+                byte[] fabMapped = (byte[])fab.Clone();
+                BitConverter.GetBytes(0u).CopyTo(fabMapped, optHdr + 56);
+                var fabBuild = DebugEngine.ReadMappedBuild(FileAsMapped(fabMapped), null);
+                if (fabBuild.Size != 0)
+                    failures.Add("same-name dlls: a mapped header whose SizeOfImage is 0 read as size 0x" + fabBuild.Size.ToString("X") + ", not 0");
+                if (DebugEngine.ClaimUnmapped(fabTable, Path.Combine(root, "Gone", "fab.dll"), "fab.dll", fabBuild) != null)
+                    failures.Add("same-name dlls: a mapped header with no SizeOfImage claimed a preload of size 0x10000");
+                if (DebugEngine.ClaimUnmapped(fabTable, Path.Combine(root, "Gone", "fab.dll"), "fab.dll",
+                                              DebugEngine.ReadMappedBuild(FileAsMapped(fab), null)) == null)
+                    failures.Add("same-name dlls (control): the fab.dll header with its size intact did not claim its preload");
+
+                // Empty debug data is no identity: two files whose debug entries both say 0 bytes compare nothing.
+                Func<string, string> writeEmptyDebug = dir =>
+                {
+                    string f = writeAs(dir, 0x77777777, "nodebug.dll");
+                    byte[] nb = File.ReadAllBytes(f);
+                    BitConverter.GetBytes(0u).CopyTo(nb, dbgEntryOff + 16);
+                    File.WriteAllBytes(f, nb);
+                    return f;
+                };
+                string emptyPre = writeEmptyDebug("EmptyPre"), emptyCopy = writeEmptyDebug("EmptyCopy");
+                var emptyTable = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false, new[] { emptyPre }).ModulesForTest();
+                var emptyDisk = PeImage.Load(emptyCopy);
+                if (DebugEngine.ClaimUnmapped(emptyTable, DebugEngine.CanonicalImagePath(emptyCopy), "nodebug.dll",
+                        new DebugEngine.MappedBuild { DiskPe = emptyDisk, Stamp = 0x77777777, Size = emptyDisk.SizeOfImage }) != null)
+                    failures.Add("same-name dlls: two copies whose debug data is EMPTY were taken for the same build");
 
                 var twins = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false, new[] { twinA, twinB });
                 table = twins.ModulesForTest();
@@ -92,6 +185,377 @@ namespace ClarionDbg.Cli
             }
             catch (Exception ex) { failures.Add("same-name dlls: " + ex.GetType().Name + ": " + ex.Message); }
             finally { try { Directory.Delete(root, true); } catch { } }
+        }
+
+        /// <summary>A U32 reader over a PE FILE laid out as the loader would map it, for ReadMappedBuild: an RVA below
+        /// the first section is a header offset (the same in file and memory), any other goes through the section
+        /// table - of <paramref name="layout"/> when given (so a header patched to be unparseable keeps its layout),
+        /// else of the bytes themselves. With neither it reads raw offsets; anything out of range reads 0, as an
+        /// unreadable page does.</summary>
+        private static Func<uint, uint> FileAsMapped(byte[] bytes, PeImage layout = null)
+        {
+            PeImage pe = layout;
+            if (pe == null) { try { pe = new PeImage(bytes); } catch { pe = null; } }
+            uint firstSection = uint.MaxValue;
+            if (pe != null) foreach (var s in pe.Sections) firstSection = Math.Min(firstSection, s.VirtualAddress);
+            return rva =>
+            {
+                long off = (pe == null || rva < firstSection) ? rva : pe.RvaToOffset(rva);
+                return (off < 0 || off + 4 > bytes.Length) ? 0u : BitConverter.ToUInt32(bytes, (int)off);
+            };
+        }
+
+        /// <summary>
+        /// Two LIVE entries never share a Path (fb5766d1 #3), through the REAL <see cref="DebugEngine.YieldBorrowedPaths"/>
+        /// and the REAL unmap handler. A same-build claim borrows its preload's path; when the preload's own file maps
+        /// too, the borrower takes its mapped path, whichever of the two mapped last, and on unmap a preloaded entry
+        /// answers to its preload path again.
+        /// </summary>
+        private static void CheckBorrowedPathsYield(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("when a preload's own file maps while a same-build copy holds that preload's path, the copy's entry "
+                         + "takes its own mapped path and the new entry keeps the preload path (either mapping order); entries "
+                         + "on different paths are left alone; and an unmapped preload answers to its preload path again, re-sending "
+                         + "the breakpoint list when that moved its path, so a host row that learned the yielded path does not "
+                         + "survive as a ghost (and an unmap that moves no path re-sends nothing).");
+
+            const string pre = @"C:\App\Dll1\shared.dll", cpy = @"C:\App\Exe\shared.dll";
+            Func<string, string, uint, bool, LoadedModule> mk = (path, mapped, b, preloaded) => new LoadedModule
+            { Path = path, MappedPath = mapped, LoadBase = b, Name = "shared.dll", Preloaded = preloaded, PreloadPath = preloaded ? pre : null };
+
+            // Copy mapped first (borrowed the preload's path), then the preload's own file maps.
+            var borrower = mk(pre, cpy, 0x10000000, true);
+            var genuine = mk(pre, pre, 0x20000000, false);
+            var changed = DebugEngine.YieldBorrowedPaths(new List<LoadedModule> { borrower, genuine }, genuine);
+            if (changed.Count != 1 || changed[0] != borrower || borrower.Path != cpy || genuine.Path != pre)
+                failures.Add("borrowed paths: after the preload's own file mapped, the copy must answer to " + cpy + " and the new entry to "
+                             + pre + "; got copy=" + borrower.Path + " new=" + genuine.Path + " changed=" + changed.Count);
+
+            // The other order: the genuine image is live, and the borrower is the one that just mapped.
+            borrower = mk(pre, cpy, 0x10000000, true);
+            genuine = mk(pre, pre, 0x20000000, false);
+            changed = DebugEngine.YieldBorrowedPaths(new List<LoadedModule> { genuine, borrower }, borrower);
+            if (changed.Count != 1 || changed[0] != borrower || borrower.Path != cpy || genuine.Path != pre)
+                failures.Add("borrowed paths: a borrower mapping while the genuine image is live must take its own path; got copy="
+                             + borrower.Path + " genuine=" + genuine.Path + " changed=" + changed.Count);
+
+            // Control: a borrower alone, and a borrower beside an image on another path, keep their paths.
+            borrower = mk(pre, cpy, 0x10000000, true);
+            var other = mk(@"C:\App\Dll2\shared.dll", @"C:\App\Dll2\shared.dll", 0x20000000, false);
+            changed = DebugEngine.YieldBorrowedPaths(new List<LoadedModule> { borrower, other }, other);
+            if (changed.Count != 0 || borrower.Path != pre || other.Path != @"C:\App\Dll2\shared.dll")
+                failures.Add("borrowed paths (control): a borrower with no image genuinely at its path must keep it; got " + borrower.Path);
+
+            // An unmapped borrower is not live, so it does not collide.
+            borrower = mk(pre, null, 0, true);
+            genuine = mk(pre, pre, 0x20000000, false);
+            changed = DebugEngine.YieldBorrowedPaths(new List<LoadedModule> { borrower, genuine }, genuine);
+            if (changed.Count != 0 || borrower.Path != pre)
+                failures.Add("borrowed paths: an UNMAPPED preload yielded its path to a live image");
+
+            // The REAL unmap handler restores the preload path of an entry that had yielded it.
+            string root = Path.Combine(Path.GetTempPath(), "cadbg-yield-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(root);
+                string dll = Path.Combine(root, "shared.dll");
+                File.Copy(typeof(PeImage).Assembly.Location, dll);
+                var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false, new[] { dll });
+                var e = eng.ModulesForTest().Find(x => x.Preloaded);
+                if (e == null) { failures.Add("borrowed paths: the fixture DLL did not preload"); return; }
+                string prePath = e.Path;
+                eng.EmitJson = true;
+                e.LoadBase = 0x30000000; e.MappedPath = cpy; e.Path = cpy;   // as after a yield
+                string outp = CaptureConsole(() => eng.DllUnloadedForTest(0x30000000));
+                if (e.LoadBase != 0 || e.MappedPath != null || e.Path != prePath)
+                    failures.Add("borrowed paths: an unmapped preload must answer to its preload path " + prePath + " again; got Path="
+                                 + e.Path + " MappedPath=" + e.MappedPath + " LoadBase=0x" + e.LoadBase.ToString("X"));
+                // The host keeps a learned owner, so the path change must reach it as a full list re-sync.
+                if (outp.IndexOf("\"event\":\"bp-list\"", StringComparison.Ordinal) < 0)
+                    failures.Add("borrowed paths: an unmap that moved the path back to the preload's sent no bp-list: " + outp.Trim());
+                // Control: an unmap that changes no path sends none.
+                e.LoadBase = 0x30000000; e.MappedPath = prePath;
+                outp = CaptureConsole(() => eng.DllUnloadedForTest(0x30000000));
+                if (outp.IndexOf("\"event\":\"bp-list\"", StringComparison.Ordinal) >= 0 || e.LoadBase != 0)
+                    failures.Add("borrowed paths (control): an unmap that changed no path sent a bp-list: " + outp.Trim());
+            }
+            catch (Exception ex) { failures.Add("borrowed paths: " + ex.GetType().Name + ": " + ex.Message); }
+            finally { try { Directory.Delete(root, true); } catch { } }
+        }
+
+        /// <summary>
+        /// An <c>|img=</c> breakpoint follows the path it named across a yield (be6bb31c #4), through the REAL bp command
+        /// and the REAL <see cref="DebugEngine.ImageMappedForTest"/>, which runs OnDllLoaded's own tail. The images are
+        /// TSWD blobs protocolcheck builds (<see cref="BuildAttributionBlob"/>) at nonzero bases with no process
+        /// attached, so no byte is read or written: an INT3 is seeded with PlantForTest and its restore seen in the
+        /// armed count. NOT COVERED: the same sequence against a live two-DLL debuggee.
+        /// </summary>
+        private static void CheckYieldRebindsImgBreakpoints(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("when a preload's own file maps while a same-build copy holds the preload's path, a breakpoint added "
+                         + "with |img=<preload path> leaves the copy (its INT3 restored unless another breakpoint in the copy still "
+                         + "uses it) and binds to the image now at that path, a pending |img=<copy path> breakpoint binds to the "
+                         + "copy, the bp-list re-sync comes after both and names the final owners, and a del naming either path "
+                         + "reaches its breakpoint; when restoring the copy's byte FAILS, the breakpoint stays bound to the copy with "
+                         + "its VA still armed, the failure is printed with its address, and no re-home is echoed; with two addresses where "
+                         + "the second restore fails, the first is re-planted (0xCC) and stays armed, and if that re-plant fails too it "
+                         + "is named and leaves both the armed set and the binding, so every address the binding keeps is planted.");
+
+            const string Pre = @"C:\App\Dll1\shared.dll", Cpy = @"C:\App\Exe\shared.dll";
+            Func<string, string> img = p => "|img=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(p));
+            Func<TswdDebugInfo> blob = () => new TswdDebugInfo(BuildAttributionBlob(), 0, 0x0F00, 0x2000, 0x10000);
+            Func<DebugEngine, string[], string> bps = (eng, want) =>
+            {
+                var got = eng.BpsForTest();
+                got.Sort(StringComparer.Ordinal);
+                var w = new List<string>(want);
+                w.Sort(StringComparer.Ordinal);
+                return string.Join(" ", got) == string.Join(" ", w) ? null
+                     : "[" + string.Join(" ", got) + "], expected [" + string.Join(" ", w) + "]";
+            };
+            Func<DebugEngine, LoadedModule> borrowerIn = eng =>
+            {
+                var b = eng.AddImageForTest(Pre, blob(), 0x10000000);
+                b.MappedPath = Cpy; b.Preloaded = true; b.PreloadPath = Pre;   // a same-build claim: Path borrowed
+                return b;
+            };
+            Func<DebugEngine, LoadedModule> genuineIn = eng =>
+            {
+                var g = eng.AddImageForTest(Pre, blob(), 0x20000000);
+                g.MappedPath = Pre;
+                return g;
+            };
+
+            try
+            {
+                // Case A and case B together: one |img= breakpoint per path, nothing else sharing the INT3.
+                var eng = NewEngine();
+                eng.EmitJson = true;
+                var borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:20" + img(Cpy)));
+                string e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:20@(pending)" });
+                if (e != null) { failures.Add("yield rebind: the fixture bound " + e); return; }
+                var vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1) { failures.Add("yield rebind: the fixture breakpoint has " + vas.Count + " address(es), expected 1"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                int armed = eng.ArmedCountForTest;
+                var writes = new List<string>();
+                Func<uint, byte, bool> record = (va, b) => { writes.Add(va.ToString("X8") + "=" + b.ToString("X2")); return true; };
+                eng.SetRestoreWriteHookForTest(record);
+
+                var genuine = genuineIn(eng);
+                string log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                if (string.Join(" ", writes) != vas[0].ToString("X8") + "=90")
+                    failures.Add("yield rebind: leaving the copy must write the original byte 90 back at " + vas[0].ToString("X8")
+                                 + " once; wrote [" + string.Join(" ", writes) + "]");
+                if (borrower.Path != Cpy || genuine.Path != Pre)
+                    failures.Add("yield rebind: the fixture did not yield (copy=" + borrower.Path + " new=" + genuine.Path + ")");
+                e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:20@" + Cpy });
+                if (e != null) failures.Add("yield rebind: after the preload's own file mapped the breakpoints are " + e);
+                if (eng.BpVasForTest("A.CLW", 5, borrower).Count != 0 || eng.BpVasForTest("A.CLW", 5, genuine).Count != 1)
+                    failures.Add("yield rebind: the |img=<preload> breakpoint must leave the copy for the image now at " + Pre);
+                if (eng.ArmedCountForTest != armed - 1)
+                    failures.Add("yield rebind: the copy's INT3 for the |img=<preload> breakpoint was not restored (armed "
+                                 + armed + " -> " + eng.ArmedCountForTest + ")");
+
+                // The re-sync is the host's last word: after every bp-set, and naming both final owners.
+                int list = log.LastIndexOf("\"event\":\"bp-list\"", StringComparison.Ordinal);
+                int lastSet = log.LastIndexOf("\"event\":\"bp-set\"", StringComparison.Ordinal);
+                if (list < 0 || list < lastSet)
+                    failures.Add("yield rebind: the bp-list re-sync must follow the rebinding's bp-set echoes: " + log.Trim());
+                else
+                {
+                    int eol = log.IndexOf('\n', list);
+                    string line = eol < 0 ? log.Substring(list) : log.Substring(list, eol - list);
+                    if (line.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) < 0
+                        || line.IndexOf("\"ownerPath\":" + Json.Str(Cpy), StringComparison.Ordinal) < 0
+                        || line.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                        failures.Add("yield rebind: the bp-list re-sync must carry the final owners " + Pre + " and " + Cpy + ": " + line);
+                }
+
+                // A del naming each path reaches the breakpoint that asked for it, and only that one.
+                CaptureConsole(() => eng.BpCommandForTest("bp del A.CLW:5" + img(Pre)));
+                e = bps(eng, new[] { "A.CLW:20@" + Cpy });
+                if (e != null) failures.Add("yield rebind: `bp del A.CLW:5|img=<preload>` left " + e);
+                CaptureConsole(() => eng.BpCommandForTest("bp del A.CLW:20" + img(Cpy)));
+                e = bps(eng, new string[0]);
+                if (e != null) failures.Add("yield rebind: `bp del A.CLW:20|img=<copy>` left " + e);
+
+                // Ref-count: an unqualified breakpoint in the copy snapped to the same INT3 keeps it planted.
+                eng = NewEngine();
+                borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:4"));
+                var shared = eng.BpVasForTest("A.CLW", 4, borrower);
+                vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1 || shared.Count != 1 || shared[0] != vas[0])
+                { failures.Add("yield rebind: the fixture's lines 4 and 5 do not share one INT3 in the copy"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                armed = eng.ArmedCountForTest;
+                writes.Clear();
+                eng.SetRestoreWriteHookForTest(record);
+                genuine = genuineIn(eng);
+                CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:4@" + Cpy, "A.CLW:4@" + Pre });
+                if (e != null) failures.Add("yield rebind (shared INT3): the breakpoints are " + e);
+                if (eng.ArmedCountForTest != armed || writes.Count != 0)
+                    failures.Add("yield rebind (shared INT3): leaving the copy restored an INT3 an unqualified breakpoint there still uses");
+
+                // A restore that FAILS (fde2387e): the breakpoint stays bound to the copy, its VA stays armed, the
+                // failure is named, and no re-home to the preload path is echoed.
+                eng = NewEngine();
+                eng.EmitJson = true;
+                borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1) { failures.Add("yield rebind (failed restore): the fixture breakpoint has " + vas.Count + " address(es)"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                writes.Clear();
+                eng.SetRestoreWriteHookForTest((va, b) => { writes.Add(va.ToString("X8")); return false; });
+                genuine = genuineIn(eng);
+                log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                if (writes.Count != 1)
+                    failures.Add("yield rebind (failed restore): the fixture's restore was attempted " + writes.Count + " time(s), expected 1");
+                e = bps(eng, new[] { "A.CLW:5@" + Cpy });
+                if (e != null) failures.Add("yield rebind (failed restore): the breakpoint must stay bound to the copy; it is " + e);
+                var still = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (still.Count != 1 || still[0] != vas[0] || !eng.IsArmedForTest(vas[0]))
+                    failures.Add("yield rebind (failed restore): the INT3 at " + vas[0].ToString("X8") + " must stay armed and owned by the copy's breakpoint");
+                if (log.IndexOf("could not restore the original byte at 0x" + vas[0].ToString("X8"), StringComparison.Ordinal) < 0)
+                    failures.Add("yield rebind (failed restore): the failure was not named: " + log.Trim());
+                if (log.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) >= 0
+                    || log.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                    failures.Add("yield rebind (failed restore): a re-home was echoed for a breakpoint that stayed in the copy: " + log.Trim());
+
+                // Two RVAs, the FIRST restore succeeds and the second fails: all or nothing, so the first is re-planted
+                // and re-armed before the binding is kept; and if that re-plant fails too, the binding shrinks to match.
+                foreach (bool replantFails in new[] { false, true })
+                {
+                    string tag = replantFails ? "yield rebind (failed restore and re-plant): " : "yield rebind (multi-address rollback): ";
+                    eng = NewEngine();
+                    eng.EmitJson = true;
+                    borrower = borrowerIn(eng);
+                    CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                    eng.AddBpRvaForTest("A.CLW", 5, borrower, 0x1200);
+                    var two = eng.BpVasForTest("A.CLW", 5, borrower);
+                    if (two.Count != 2) { failures.Add(tag + "the fixture breakpoint has " + two.Count + " address(es), expected 2"); return; }
+                    eng.PlantForTest(two[0], 0x90, false);
+                    eng.PlantForTest(two[1], 0x91, false);
+                    var mem = new Dictionary<uint, byte> { { two[0], 0xCC }, { two[1], 0xCC } };
+                    var trail = new List<string>();
+                    eng.SetRestoreWriteHookForTest((va, b) =>
+                    {
+                        bool ok = b == 0xCC ? !replantFails : va != two[1];
+                        trail.Add(va.ToString("X8") + "=" + b.ToString("X2") + (ok ? "" : "!"));
+                        if (ok) mem[va] = b;
+                        return ok;
+                    });
+                    genuine = genuineIn(eng);
+                    log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                    string want = two[0].ToString("X8") + "=90 " + two[1].ToString("X8") + "=91! " + two[0].ToString("X8") + "=CC"
+                                  + (replantFails ? "!" : "");
+                    if (string.Join(" ", trail) != want)
+                        failures.Add(tag + "writes were [" + string.Join(" ", trail) + "], expected [" + want + "]");
+                    e = bps(eng, new[] { "A.CLW:5@" + Cpy });
+                    if (e != null) failures.Add(tag + "the breakpoint must stay bound to the copy; it is " + e);
+                    var kept = eng.BpVasForTest("A.CLW", 5, borrower);
+                    var expectKept = replantFails ? new List<uint> { two[1] } : new List<uint> { two[0], two[1] };
+                    if (string.Join(",", kept) != string.Join(",", expectKept))
+                        failures.Add(tag + "the binding holds [" + string.Join(",", kept) + "], expected [" + string.Join(",", expectKept) + "]");
+                    foreach (var va in kept)   // every retained address is planted AND tracked
+                        if (mem[va] != 0xCC || !eng.IsArmedForTest(va))
+                            failures.Add(tag + "retained address " + va.ToString("X8") + " is " + mem[va].ToString("X2")
+                                         + (eng.IsArmedForTest(va) ? "" : " and not armed") + ", expected planted (CC) and armed");
+                    if (replantFails && (eng.IsArmedForTest(two[0])
+                        || log.IndexOf("could not re-plant 0x" + two[0].ToString("X8"), StringComparison.Ordinal) < 0))
+                        failures.Add(tag + "an address whose re-plant failed must be named and leave the armed set: " + log.Trim());
+                    if (log.IndexOf("could not restore the original byte at 0x" + two[1].ToString("X8"), StringComparison.Ordinal) < 0)
+                        failures.Add(tag + "the failed restore was not named: " + log.Trim());
+                    if (log.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) >= 0
+                        || log.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                        failures.Add(tag + "a re-home was echoed for a breakpoint that stayed in the copy: " + log.Trim());
+                }
+            }
+            catch (Exception ex) { failures.Add("yield rebind: " + ex.GetType().Name + ": " + ex.Message); }
+        }
+
+        /// <summary>
+        /// `expand` with the row's imgBase as a 5th argument names ONE image (w8-expand-base), through the REAL
+        /// <see cref="DebugEngine.ExpandImage"/> the handler resolves with, and every expandable row carries that base,
+        /// through the REAL row builder. NOT COVERED: the handler's TSWD type lookup (needs a real image's types).
+        /// </summary>
+        private static void CheckExpandBaseNamesOneImage(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("expand with a 0x-hex 5th argument resolves the mapped image with that name AND base, so two same-named "
+                         + "DLLs are told apart; a base matching no mapped image of that name, another name's base, an unmapped "
+                         + "image resolves nothing; the imgBase grammar refuses every string on the frozen w9-imgbase bad list (0X "
+                         + "included) and parses every one on its good list to its value, two spellings of one base naming one image; four arguments keep the first image of the name; and every "
+                         + "expandable row (by-ref group and array-of-group element) carries imgBase as 0x + 8 hex digits next to module.");
+
+            var x = new LoadedModule { Name = "shared.dll", LoadBase = 0x10000000 };
+            var y = new LoadedModule { Name = "shared.dll", LoadBase = 0x20000000 };
+            var z = new LoadedModule { Name = "other.dll", LoadBase = 0x30000000 };
+            var u = new LoadedModule { Name = "shared.dll", LoadBase = 0 };
+            var table = new List<LoadedModule> { u, x, y, z };
+            Func<string, LoadedModule> exp = b => DebugEngine.ExpandImage(table,
+                b == null ? new[] { "expand", "1", "shared.dll", "5", "0x400000" }
+                          : new[] { "expand", "1", "shared.dll", "5", "0x400000", b });
+
+            if (exp(null) != x) failures.Add("expand base: four arguments must keep the first MAPPED image of the name");
+            if (exp("0x20000000") != y) failures.Add("expand base: 0x20000000 did not resolve the second shared.dll");
+            if (exp("0x10000000") != x) failures.Add("expand base: 0x10000000 did not resolve the first shared.dll");
+            if (DebugEngine.ExpandImage(table, new[] { "expand", "1", "SHARED.DLL", "5", "0x400000", "0x20000000" }) != y)
+                failures.Add("expand base: the module name must match case-insensitively");
+            foreach (var bad in new[] { "0x30000000", "0x40000000", "0x0", "0x00000000" })
+                if (exp(bad) != null) failures.Add("expand base: " + bad + " names no mapped shared.dll but resolved one (fail closed)");
+
+            // w9-imgbase rule 3: EXACTLY the frozen lists, in order, the same strings the host's suite holds.
+            foreach (var bad in new[] { "", "0x", "0X400000", "400000", "0x123456789", "-0x400000", " 0x400000", "0x400000 ", "0x400000\n", "0x40000G" })
+            {
+                uint v;
+                if (DebugEngine.TryParseImgBase(bad, out v))
+                    failures.Add("expand base: malformed base '" + bad.Replace("\n", "\\n") + "' parsed as 0x" + v.ToString("X"));
+            }
+            var good = new[] { "0x400000", "0x00400000", "0x0040000a", "0xFFFFFFFF" };
+            var want = new uint[] { 0x400000, 0x400000, 0x40000A, 0xFFFFFFFF };
+            for (int i = 0; i < good.Length; i++)
+            {
+                uint v;
+                if (!DebugEngine.TryParseImgBase(good[i], out v) || v != want[i])
+                    failures.Add("expand base: well-formed base '" + good[i] + "' did not parse to 0x" + want[i].ToString("X"));
+            }
+            var y4 = new LoadedModule { Name = "shared.dll", LoadBase = 0x400000 };
+            var t4 = new List<LoadedModule> { y4 };
+            foreach (var g in new[] { "0x400000", "0x00400000" })   // rule 4: two spellings of one base name one image
+                if (DebugEngine.ExpandImage(t4, new[] { "expand", "1", "shared.dll", "5", "0x400000", g }) != y4)
+                    failures.Add("expand base: '" + g + "' did not resolve the image at 0x00400000");
+
+            var eng = NewEngine();
+            var grp = new ClarionType { Kind = TypeKind.Group, Size = 8, TypeRef = 7, Members = new List<TypeMember>() };
+            var arr = new ClarionType { Kind = TypeKind.Array, Length = 2, LoBound = 1, ElemSize = 8, ElemType = grp, Size = 16 };
+            string a = eng.NodeJsonForTest("A", arr, 0x18, 0, 16, 0, 0x400000, "shared.dll", 0x20000000, null, true);
+            if (Count(a, "\"ref\":true") != 2 || Count(a, "\"module\":\"shared.dll\",\"imgBase\":\"0x20000000\"") != 2)
+                failures.Add("expand base: each array-of-group element row must carry module then imgBase 0x20000000: " + a);
+            string a0 = eng.NodeJsonForTest("A", arr, 0x18, 0, 16, 0, 0x400000, "shared.dll", null, true);
+            if (Count(a0, "\"imgBase\":\"0x00000000\"") != 2)
+                failures.Add("expand base: a row of an image at base 0 must still carry imgBase as 8 hex digits: " + a0);
+
+            // A by-ref group reads its pointer slot, so it reads THIS process.
+            var self = System.Diagnostics.Process.GetCurrentProcess();
+            IntPtr slot = System.Runtime.InteropServices.Marshal.AllocHGlobal(4);
+            try
+            {
+                System.Runtime.InteropServices.Marshal.WriteInt32(slot, 0x12345678);
+                var live = NewEngine();
+                live.SetProcessHandleForTest(self.Handle);
+                var refType = new ClarionType { Kind = TypeKind.Reference, Size = 4, Referent = grp };
+                string r = live.NodeJsonForTest("R", refType, 0x16, 0, 4, 0, unchecked((uint)slot.ToInt32()), "shared.dll", 0x0ABCDEF0, null, true);
+                if (r.IndexOf("\"ref\":true", StringComparison.Ordinal) < 0
+                    || r.IndexOf("\"module\":\"shared.dll\",\"imgBase\":\"0x0ABCDEF0\"", StringComparison.Ordinal) < 0)
+                    failures.Add("expand base: a by-ref group row must carry module then imgBase 0x0ABCDEF0: " + r);
+            }
+            finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(slot); }
         }
 
         /// <summary>

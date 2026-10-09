@@ -60,21 +60,27 @@ namespace ClarionDebugger.Terminal
         }
     }
 
-    /// <summary>Lazy reference expansion: <c>reqId|module|typeRef|addr</c>.</summary>
+    /// <summary>Lazy reference expansion: <c>reqId|module|typeRef|addr</c>, or <c>reqId|module|typeRef|addr|imgBase</c>
+    /// when the row carried the load base of its image (w8-expand-base). A fifth field that is not
+    /// <see cref="WireRules.IsImageBase"/> grammar - an empty one included - rejects the whole request.</summary>
     internal sealed class ExpandRequest
     {
         public int ReqId;
         public string Module;
         public uint TypeRef;
         public string Addr;
+        /// <summary>The row's <c>imgBase</c> exactly as the page sent it, or null when it sent none.</summary>
+        public string ImgBase;
 
         public static ExpandRequest Parse(string data)
         {
             if (string.IsNullOrEmpty(data)) return null;
             var a = data.Split('|');
             int rq; uint tr;
-            if (a.Length != 4 || !PageNumbers.TryInt(a[0], out rq) || !PageNumbers.TryUInt(a[2], out tr)) return null;
-            return new ExpandRequest { ReqId = rq, Module = a[1], TypeRef = tr, Addr = a[3] };
+            if ((a.Length != 4 && a.Length != 5) || !PageNumbers.TryInt(a[0], out rq) || !PageNumbers.TryUInt(a[2], out tr)) return null;
+            string imgBase = a.Length == 5 ? a[4] : null;
+            if (imgBase != null && !WireRules.IsImageBase(imgBase)) return null;
+            return new ExpandRequest { ReqId = rq, Module = a[1], TypeRef = tr, Addr = a[3], ImgBase = imgBase };
         }
     }
 
